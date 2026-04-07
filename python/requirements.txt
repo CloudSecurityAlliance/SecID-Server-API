@@ -1,0 +1,7 @@
+fastapi>=0.115.0
+uvicorn>=0.34.0
+# Optional backends (uncomment as needed):
+# redis>=5.0.0
+# pymemcache>=4.0.0
+# Optional MCP server (uncomment to enable /mcp endpoint):
+# mcp>=1.0.0
