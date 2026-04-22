@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+from typing import Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,9 +95,18 @@ app.add_middleware(
 
 
 @app.get("/api/v1/resolve")
-async def api_resolve(secid: str = Query(..., description="SecID string to resolve")):
+async def api_resolve(
+    secid: str = Query(..., description="SecID string to resolve"),
+    parsability: Optional[str] = Query(None, description="Filter results by parsability: 'structured' or 'scraped'"),
+):
     """Resolve a SecID string to URLs and registry data."""
     result = resolve(store, secid, registry_dirs=args.registry)
+    # Filter by parsability if requested
+    if parsability and "results" in result:
+        result["results"] = [
+            r for r in result["results"]
+            if "url" not in r or r.get("parsability") == parsability
+        ]
     return JSONResponse(content=result)
 
 

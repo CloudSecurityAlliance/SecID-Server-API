@@ -10,6 +10,17 @@ from typing import Optional
 
 from storage import Store
 
+# Format metadata fields lifted from child data to top-level result
+_FORMAT_METADATA_FIELDS = ("parsability", "schema", "parsing_instructions", "auth", "content_type")
+
+
+def _add_format_metadata(result: dict, data: dict) -> None:
+    """Copy format metadata fields from registry data to top-level result."""
+    for field in _FORMAT_METADATA_FIELDS:
+        if data.get(field):
+            result[field] = data[field]
+
+
 SECID_TYPES = [
     "advisory", "capability", "control", "disclosure", "entity",
     "methodology", "reference", "regulation", "ttp", "weakness",
@@ -227,6 +238,7 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                             result["weight"] = child["weight"]
                         if child_data.get("url"):
                             result["url"] = child_data["url"]
+                        _add_format_metadata(result, child_data)
                         result["data"] = {
                             "description": child.get("description", ""),
                             **{k: v for k, v in child_data.items() if k != "url"},
@@ -248,6 +260,7 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                             result["weight"] = child["weight"]
                         if child_data.get("url"):
                             result["url"] = child_data["url"]
+                        _add_format_metadata(result, child_data)
                         result["data"] = {
                             "description": child.get("description", ""),
                             **{k: v for k, v in child_data.items() if k != "url"},
@@ -269,6 +282,7 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
         result["weight"] = node["weight"]
     if node_data.get("url"):
         result["url"] = node_data["url"]
+    _add_format_metadata(result, node_data)
 
     # Build data object with description and patterns
     result_data = {
@@ -299,6 +313,7 @@ def _build_leaf_result(node: dict, secid_type: str, namespace: str,
         result["weight"] = node["weight"]
     if node_data.get("url"):
         result["url"] = node_data["url"]
+    _add_format_metadata(result, node_data)
     result["data"] = {
         "description": node.get("description", ""),
         **{k: v for k, v in node_data.items() if k != "url"},
