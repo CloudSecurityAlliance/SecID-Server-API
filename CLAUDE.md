@@ -51,6 +51,7 @@ curl http://localhost:8000/health
 - **Same API**: `/api/v1/resolve` returns the same envelope as SecID-Service. Any SecID client works with any server.
 - **Multiple registries**: `--registry` can be specified multiple times. Later directories overlay earlier ones (private data supplements public).
 - **Loading strategies**: Lazy (default, instant startup), bulk (load all at startup), update (reload changed files after git pull).
+- **Format metadata on results**: Resolution results include optional `parsability` (`structured`/`scraped`), `schema` (SecID reference), `parsing_instructions` (SecID reference), `auth` (free text), and `content_type` (MIME type) fields. These describe what data format you get at each URL. The `?parsability=structured` query parameter filters for machine-readable sources only.
 
 ## Multi-Repo Architecture
 

@@ -88,6 +88,8 @@ GET /api/v1/resolve?secid=secid:advisory/mitre.org/cve%23CVE-2021-44228
 
 Same response format, same status values (`found`, `corrected`, `related`, `not_found`, `error`). Any SecID client (SDK, plugin, MCP) works with any SecID server.
 
+Resolution results may include optional format metadata fields: `parsability`, `schema`, `parsing_instructions`, `auth`, and `content_type`. Use `?parsability=structured` to filter for machine-readable sources. See the [SecID API Response Format](https://github.com/CloudSecurityAlliance/SecID/blob/main/docs/reference/API-RESPONSE-FORMAT.md) for details.
+
 ### MCP Endpoint
 
 ```
