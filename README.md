@@ -1,3 +1,10 @@
+```
+project_tracker_base: CINO Project Tracker:appf7fRQUvY9Iy7sL
+project_tracker_table: Projects:tblchmbxSAavvJKaY
+project_tracker_record: SecID-Server-API:reccvS9lgX0bJaKWe
+project_source: github:CloudSecurityAlliance-Internal/CINO-Projects/projects/SecID-Server-API
+```
+
 # SecID-Server-API
 
 Self-hosted SecID resolver — run your own API server locally, in Docker, or on internal infrastructure.
