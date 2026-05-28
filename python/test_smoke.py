@@ -298,3 +298,47 @@ def test_load_type_info_returns_none_for_missing_registry():
     from registry_loader import load_type_info
     assert load_type_info([], "advisory") is None
     assert load_type_info(["/nonexistent/path"], "advisory") is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-source search (Phase 2.5d)
+# ---------------------------------------------------------------------------
+
+
+def test_slug_from_pattern_simple():
+    """Canonical case-insensitive pattern produces a clean slug."""
+    from resolver import _slug_from_pattern
+    assert _slug_from_pattern("(?i)^cve$") == "cve"
+    assert _slug_from_pattern("(?i)^kev$") == "kev"
+
+
+def test_slug_from_pattern_with_dots_and_dashes():
+    """Patterns with dots and dashes (allowed in slugs) extract correctly."""
+    from resolver import _slug_from_pattern
+    assert _slug_from_pattern("(?i)^av-collision$") == "av-collision"
+    assert _slug_from_pattern("(?i)^ml.top10$") == "ml.top10"
+
+
+def test_slug_from_pattern_complex_returns_none():
+    """Patterns with character classes, alternation, or quantifiers don't
+    yield a clean slug — we return None and the caller falls back to omitting
+    the source segment from the SecID."""
+    from resolver import _slug_from_pattern
+    assert _slug_from_pattern("^CVE-\\d{4}-\\d{4,}$") is None
+    assert _slug_from_pattern("(a|b)") is None
+
+
+def test_cross_source_search_empty_term():
+    """Empty search_term should return empty list immediately."""
+    from resolver import _cross_source_search
+    from storage import create_store
+    store = create_store("memory")
+    assert _cross_source_search(store, "advisory", "", None) == []
+
+
+def test_cross_source_search_no_registry():
+    """No registry data + no registry_dirs = no results."""
+    from resolver import _cross_source_search
+    from storage import create_store
+    store = create_store("memory")
+    assert _cross_source_search(store, "advisory", "CVE-2021-44228", None) == []
