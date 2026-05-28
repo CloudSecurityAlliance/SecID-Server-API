@@ -12,14 +12,15 @@ Self-hosted SecID resolver — run your own API server locally, in Docker, or on
 - **Federation** — register your resolver in the SecID ecosystem so others can discover it
 - **Customization** — extend the resolver, add auth, integrate with internal systems
 
-## Two Implementations
+## Implementations
 
-| Implementation | Language | Best for |
-|---------------|----------|----------|
-| **Python** | Python 3.10+ | Quick start, reference implementation, easy to extend |
-| **TypeScript** | Node.js 22+ | Closest to production SecID-Service, higher throughput |
+| Implementation | Status | Language | Best for |
+|---------------|--------|----------|----------|
+| **Python** | Active | Python 3.10+ | **Reference implementation** — shows all the moving parts (REST API + MCP + pluggable storage). Optimized for clarity and ease of extension; read the code to understand SecID server-side. |
+| **TypeScript** | Planned | Node.js 22+ | Production-grade throughput; closest shape to SecID-Service's Cloudflare Worker. |
+| **Go** | Planned | Go 1.22+ | Production-grade throughput; single static binary for deployment. |
 
-Both serve the same API, pass the same test suite, and support the same storage backends.
+All implementations serve the same REST API, pass the same conformance suite, and support the same storage backends. The Python implementation additionally exposes an optional MCP endpoint — see below.
 
 ## Quick Start (Python)
 
@@ -90,13 +91,23 @@ Same response format, same status values (`found`, `corrected`, `related`, `not_
 
 Resolution results may include optional format metadata fields: `parsability`, `schema`, `parsing_instructions`, `auth`, and `content_type`. Use `?parsability=structured` to filter for machine-readable sources. See the [SecID API Response Format](https://github.com/CloudSecurityAlliance/SecID/blob/main/docs/reference/API-RESPONSE-FORMAT.md) for details.
 
-### MCP Endpoint
+### MCP Endpoint (optional)
 
 ```
 /mcp
 ```
 
-Point any MCP client at your self-hosted server. Same three tools: `resolve`, `lookup`, `describe`.
+Point any MCP client at your self-hosted server. Same three tools as SecID-Service: `resolve`, `lookup`, `describe`.
+
+MCP support requires the `mcp` Python package:
+
+```bash
+pip install mcp
+```
+
+Without it, the server starts normally and serves the REST API; the `/mcp` endpoint is logged as "disabled" at startup. This keeps the MCP dependency optional for users who only need the REST API.
+
+The Python implementation is currently the only one with MCP support — TS/Go implementations (when built) will serve REST only. The canonical production MCP surface remains [SecID-Service](https://secid.cloudsecurityalliance.org/mcp).
 
 ## Private Registry Data
 
