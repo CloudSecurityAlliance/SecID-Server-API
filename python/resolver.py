@@ -154,6 +154,19 @@ def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> 
     namespace, name = _match_namespace(store, secid_type, path_no_version, registry_dirs)
 
     if namespace is None:
+        # Cross-source search: no namespace matched, but the path might be
+        # an ID that matches a child pattern in one or more namespaces. E.g.,
+        # `secid:advisory/CVE-2021-44228` should hit every advisory namespace
+        # whose child patterns recognize the CVE-2021-44228 format.
+        cross_results = _cross_source_search(
+            store, secid_type, path_no_version, registry_dirs
+        )
+        if cross_results:
+            return {
+                "secid_query": secid_query,
+                "status": "found",
+                "results": cross_results,
+            }
         return _not_found(secid_query, f"No namespace found for '{path_no_version}' in type '{secid_type}'")
 
     # Load namespace data
@@ -413,6 +426,160 @@ def _namespace_result(secid_query: str, secid_type: str, namespace: str, data: d
         "status": "found",
         "results": [_build_namespace_summary(secid_type, namespace, data)],
     }
+
+
+# ---------------------------------------------------------------------------
+# Cross-source search (Phase 2.5d)
+#
+# Scans all namespaces of a type for child-pattern matches against a search
+# term. Used when a bare-namespace query (no DNS-rooted namespace specified)
+# is issued — e.g., `secid:advisory/CVE-2021-44228` should match every
+# advisory namespace whose child patterns recognize the CVE-2021-44228
+# format, returning aggregated results sorted by weight.
+# ---------------------------------------------------------------------------
+
+
+def _slug_from_pattern(pat: str) -> Optional[str]:
+    """Extract a source slug from a regex pattern like '(?i)^cve$' -> 'cve'.
+
+    Returns None if the pattern is too complex for a clean slug (e.g.,
+    contains character classes, alternation, or quantifiers other than
+    the canonical anchors and case-insensitive flag).
+    """
+    p = re.sub(r"^\(\?i\)", "", pat)
+    p = re.sub(r"^\^|\$$", "", p)
+    if re.fullmatch(r"[\w.-]+", p):
+        return p
+    return None
+
+
+def _all_namespaces_of_type(
+    store: Store, secid_type: str, registry_dirs: Optional[list[str]]
+) -> list[str]:
+    """Return all known namespaces of secid_type.
+
+    Discovers namespaces from two sources:
+      1. The store (already-loaded namespace data)
+      2. The filesystem (registry/<type>/**/*.json files)
+
+    Filesystem-discovered namespaces are eagerly loaded into the store
+    so subsequent queries don't re-read them. The 'namespace' field
+    inside each JSON file is used as canonical — avoids the reverse-DNS
+    path-to-namespace ambiguity (e.g., is 'uk/gov/legislation.json' the
+    three-label domain 'legislation.gov.uk' or 'legislation/uk' with path?).
+    """
+    namespaces: set[str] = set()
+
+    # From store: keys like 'secid:advisory/mitre.org'
+    prefix = f"secid:{secid_type}/"
+    for key in store.keys():
+        if not key.startswith(prefix):
+            continue
+        try:
+            data = json.loads(store.get(key) or "{}")
+            ns = data.get("namespace")
+            if ns:
+                namespaces.add(ns)
+        except json.JSONDecodeError:
+            continue
+
+    # From filesystem: walk registry/<type>/, load whatever isn't cached
+    if registry_dirs:
+        from pathlib import Path
+        for registry_dir in registry_dirs:
+            type_dir = Path(registry_dir) / secid_type
+            if not type_dir.is_dir():
+                continue
+            for json_file in sorted(type_dir.rglob("*.json")):
+                if json_file.stem.startswith("_"):
+                    continue
+                try:
+                    data = json.loads(json_file.read_text())
+                except json.JSONDecodeError:
+                    continue
+                ns = data.get("namespace")
+                if not ns:
+                    continue
+                namespaces.add(ns)
+                # Cache in store for subsequent queries
+                key = f"secid:{secid_type}/{ns}"
+                if not store.get(key):
+                    store.set(key, json.dumps(data))
+
+    return sorted(namespaces)
+
+
+def _cross_source_search(
+    store: Store, secid_type: str, search_term: str,
+    registry_dirs: Optional[list[str]],
+) -> list[dict]:
+    """Find matches for search_term across all namespaces of secid_type.
+
+    Walks each namespace's match_nodes; for each source-level node, scans
+    its children for a pattern that matches search_term. Successful matches
+    build a fully-qualified result (with source slug + subpath). Results
+    are sorted by weight descending (highest-weight sources first).
+
+    Note: this only inspects ONE level of children. Grandchild patterns
+    (rare in current registry data) are not traversed by cross-source.
+    The Worker's equivalent behavior is the canonical reference.
+    """
+    if not search_term:
+        return []
+
+    results: list[dict] = []
+    namespaces = _all_namespaces_of_type(store, secid_type, registry_dirs)
+
+    for ns in namespaces:
+        raw = store.get(f"secid:{secid_type}/{ns}")
+        if not raw:
+            continue
+        try:
+            ns_data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        for node in ns_data.get("match_nodes", []):
+            # Source slug derived from the source-level node's first
+            # extractable pattern (e.g., '(?i)^cve$' -> 'cve').
+            source_slug = next(
+                (s for p in node.get("patterns", []) if (s := _slug_from_pattern(p))),
+                None,
+            )
+
+            for child in node.get("children", []):
+                child_data = child.get("data", {})
+                matched = False
+                for pat in child.get("patterns", []):
+                    try:
+                        if re.match(pat, search_term):
+                            matched = True
+                            break
+                    except re.error:
+                        continue
+                if not matched:
+                    continue
+
+                # Build the result
+                source_part = f"/{source_slug}" if source_slug else ""
+                secid = f"secid:{secid_type}/{ns}{source_part}#{search_term}"
+                result: dict = {"secid": secid}
+                if child.get("weight"):
+                    result["weight"] = child["weight"]
+                url_template = child_data.get("url")
+                if url_template:
+                    result["url"] = _substitute_url_template(
+                        url_template, child_data, search_term
+                    )
+                    _add_format_metadata(result, child_data)
+                results.append(result)
+                # One child match per source-level node is enough; don't
+                # double-count if multiple children of the same source match.
+                break
+
+    # Sort by weight descending; entries without weight sort last.
+    results.sort(key=lambda r: -(r.get("weight", 0)))
+    return results
 
 
 def _extract_name_from_patterns(patterns: list) -> Optional[str]:
