@@ -8,6 +8,7 @@ import json
 import re
 from typing import Optional
 
+from registry_loader import SECID_TYPES
 from storage import Store
 
 # Format metadata fields lifted from child data to top-level result
@@ -19,12 +20,6 @@ def _add_format_metadata(result: dict, data: dict) -> None:
     for field in _FORMAT_METADATA_FIELDS:
         if data.get(field):
             result[field] = data[field]
-
-
-SECID_TYPES = [
-    "advisory", "capability", "control", "disclosure", "entity",
-    "methodology", "reference", "regulation", "ttp", "weakness",
-]
 
 
 def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> dict:
