@@ -22,6 +22,52 @@ def _add_format_metadata(result: dict, data: dict) -> None:
             result[field] = data[field]
 
 
+def _substitute_url_template(template: str, child_data: dict, captured_input: str) -> str:
+    """Substitute {var} placeholders in a URL template.
+
+    Two substitution modes coexist:
+
+      1. Explicit variables — a `variables` dict on the child's data, mapping
+         variable name to `{"extract": "<regex>"}`. The extract regex is matched
+         against the captured input and capture group 1 (or group 0 if no
+         groups) supplies the variable's value. Example: CWE's `{num}` is
+         extracted from "CWE-79" via `^CWE-(\\d+)$` -> "79".
+
+      2. Implicit `{id}` — defaults to the captured input itself unless an
+         explicit `id` variable was already defined. Example: CVE's
+         `{id}` in "https://www.cve.org/CVERecord?id={id}" gets "CVE-2021-44228".
+
+    The two modes are layered: implicit-{id} fills in only if not already
+    set explicitly. Unrecognized {placeholders} are left as-is so they're
+    visible in output rather than silently swallowed.
+    """
+    if "{" not in template:
+        return template
+
+    variables: dict[str, str] = {}
+
+    # Mode 1: explicit variables
+    for var_name, var_def in (child_data.get("variables") or {}).items():
+        extract_regex = var_def.get("extract") if isinstance(var_def, dict) else None
+        if not extract_regex:
+            continue
+        try:
+            m = re.match(extract_regex, captured_input)
+        except re.error:
+            continue
+        if m:
+            variables[var_name] = m.group(1) if m.groups() else m.group(0)
+
+    # Mode 2: implicit {id} default
+    variables.setdefault("id", captured_input)
+
+    # Apply substitution
+    url = template
+    for name, value in variables.items():
+        url = url.replace("{" + name + "}", value)
+    return url
+
+
 def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> dict:
     """Resolve a SecID string. Returns the API response envelope."""
     secid_query = secid_query.strip()
@@ -231,13 +277,21 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                         result = {"secid": secid}
                         if child.get("weight"):
                             result["weight"] = child["weight"]
-                        if child_data.get("url"):
-                            result["url"] = child_data["url"]
-                        _add_format_metadata(result, child_data)
-                        result["data"] = {
-                            "description": child.get("description", ""),
-                            **{k: v for k, v in child_data.items() if k != "url"},
-                        }
+                        url_template = child_data.get("url")
+                        if url_template:
+                            # URL-bearing result: substitute {var} placeholders;
+                            # do NOT include `data` block (canonical contract).
+                            result["url"] = _substitute_url_template(url_template, child_data, subpath)
+                            _add_format_metadata(result, child_data)
+                        else:
+                            # Description-only result: include `data` block
+                            # with descriptive context (variables is internal,
+                            # not exposed in the public response).
+                            _add_format_metadata(result, child_data)
+                            result["data"] = {
+                                "description": child.get("description", ""),
+                                **{k: v for k, v in child_data.items() if k not in ("url", "variables")},
+                            }
                         return result
                 except re.error:
                     continue
@@ -253,13 +307,16 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                         result = {"secid": secid}
                         if child.get("weight"):
                             result["weight"] = child["weight"]
-                        if child_data.get("url"):
-                            result["url"] = child_data["url"]
-                        _add_format_metadata(result, child_data)
-                        result["data"] = {
-                            "description": child.get("description", ""),
-                            **{k: v for k, v in child_data.items() if k != "url"},
-                        }
+                        url_template = child_data.get("url")
+                        if url_template:
+                            result["url"] = _substitute_url_template(url_template, child_data, version)
+                            _add_format_metadata(result, child_data)
+                        else:
+                            _add_format_metadata(result, child_data)
+                            result["data"] = {
+                                "description": child.get("description", ""),
+                                **{k: v for k, v in child_data.items() if k not in ("url", "variables")},
+                            }
                         return result
                 except re.error:
                     continue

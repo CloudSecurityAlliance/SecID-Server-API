@@ -79,6 +79,95 @@ def test_secid_types_single_source():
 
 
 # ---------------------------------------------------------------------------
+# URL template substitution (added in Phase 2.5a)
+# ---------------------------------------------------------------------------
+
+
+def test_substitute_template_no_placeholders():
+    """Template without {} placeholders is returned verbatim."""
+    from resolver import _substitute_url_template
+    assert _substitute_url_template("https://example.com/static", {}, "anything") == "https://example.com/static"
+
+
+def test_substitute_implicit_id():
+    """{id} defaults to the whole captured input when no explicit variable is defined.
+    Tests the CVE case: pattern is '^CVE-\\d{4}-\\d{4,}$', URL is '...?id={id}'.
+    """
+    from resolver import _substitute_url_template
+    url = _substitute_url_template(
+        "https://www.cve.org/CVERecord?id={id}",
+        {},
+        "CVE-2021-44228",
+    )
+    assert url == "https://www.cve.org/CVERecord?id=CVE-2021-44228"
+
+
+def test_substitute_explicit_variable():
+    """Explicit {num} via variables.num.extract regex.
+    Tests the CWE case: extract '^CWE-(\\d+)$' against 'CWE-79' yields '79'."""
+    from resolver import _substitute_url_template
+    child_data = {
+        "variables": {
+            "num": {"extract": r"^CWE-(\d+)$", "description": "Numeric CWE ID"}
+        }
+    }
+    url = _substitute_url_template(
+        "https://cwe.mitre.org/data/definitions/{num}.html",
+        child_data,
+        "CWE-79",
+    )
+    assert url == "https://cwe.mitre.org/data/definitions/79.html"
+
+
+def test_substitute_multiple_variables():
+    """ATT&CK sub-techniques use {parent} and {sub} from two extract regexes."""
+    from resolver import _substitute_url_template
+    child_data = {
+        "variables": {
+            "parent": {"extract": r"^(T\d{4})\.\d{3}$"},
+            "sub": {"extract": r"^T\d{4}\.(\d{3})$"},
+        }
+    }
+    url = _substitute_url_template(
+        "https://attack.mitre.org/techniques/{parent}/{sub}/",
+        child_data,
+        "T1059.003",
+    )
+    assert url == "https://attack.mitre.org/techniques/T1059/003/"
+
+
+def test_substitute_implicit_id_with_explicit_others():
+    """Implicit {id} should still default even when explicit variables exist
+    for other placeholders. Layered, not mutually exclusive."""
+    from resolver import _substitute_url_template
+    child_data = {
+        "variables": {
+            "num": {"extract": r"^CAPEC-(\d+)$"},
+        }
+    }
+    # If a template used both {id} and {num}, both should be filled
+    url = _substitute_url_template(
+        "https://example.com/{id}-num{num}",
+        child_data,
+        "CAPEC-66",
+    )
+    assert url == "https://example.com/CAPEC-66-num66"
+
+
+def test_substitute_unrecognized_placeholder_left_visible():
+    """Unknown {placeholders} are left as-is so they're visible in output
+    rather than silently swallowed — easier to diagnose registry bugs."""
+    from resolver import _substitute_url_template
+    url = _substitute_url_template(
+        "https://example.com/{unknown}/{id}",
+        {},
+        "test123",
+    )
+    # {unknown} stays; {id} is implicit-default
+    assert url == "https://example.com/{unknown}/test123"
+
+
+# ---------------------------------------------------------------------------
 # resolve() basic invariants
 # ---------------------------------------------------------------------------
 
