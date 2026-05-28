@@ -109,6 +109,21 @@ def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> 
                         "data": json.loads(type_data),
                     }],
                 }
+            # Lazy fallback: read registry/<type>.json directly. Bulk mode
+            # would have built this into store already, but lazy mode hasn't,
+            # so we read from disk and synthesize a minimal type-info response.
+            if registry_dirs:
+                from registry_loader import load_type_info
+                info = load_type_info(registry_dirs, candidate_type)
+                if info:
+                    return {
+                        "secid_query": secid_query,
+                        "status": "found",
+                        "results": [{
+                            "secid": f"secid:{candidate_type}",
+                            "data": info,
+                        }],
+                    }
         return _not_found(secid_query)
 
     secid_type = remainder[:slash_idx].lower()

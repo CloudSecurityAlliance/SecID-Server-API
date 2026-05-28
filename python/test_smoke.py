@@ -245,3 +245,56 @@ def test_create_app_no_side_effects_on_import():
     app_a = _empty_app()
     app_b = _empty_app()
     assert app_a is not app_b
+
+
+# ---------------------------------------------------------------------------
+# Discovery endpoints (added in Phase 2.5c)
+# ---------------------------------------------------------------------------
+
+
+def test_types_endpoint_returns_all_ten():
+    """GET /api/v1/types returns the canonical 10 SecID types, even with no
+    registry directories (the type list itself is canonical, metadata is the
+    only thing that varies)."""
+    client = TestClient(_empty_app())
+    response = client.get("/api/v1/types")
+    assert response.status_code == 200
+    body = response.json()
+    assert "types" in body
+    assert len(body["types"]) == 10
+    type_names = {t["type"] for t in body["types"]}
+    assert type_names == {
+        "advisory", "capability", "control", "disclosure", "entity",
+        "methodology", "reference", "regulation", "ttp", "weakness",
+    }
+
+
+def test_types_endpoint_each_entry_has_required_fields():
+    """Each /api/v1/types entry must include the canonical shape:
+    type, description, long_description, subtypes."""
+    client = TestClient(_empty_app())
+    response = client.get("/api/v1/types")
+    for entry in response.json()["types"]:
+        assert "type" in entry
+        assert "description" in entry
+        assert "long_description" in entry
+        assert "subtypes" in entry
+        assert isinstance(entry["subtypes"], list)
+
+
+def test_list_all_types_with_no_registry():
+    """list_all_types() should always return 10 entries, with empty description
+    fields when no registry data is available."""
+    from registry_loader import list_all_types
+    types = list_all_types([])
+    assert len(types) == 10
+    # All descriptions empty when no registry
+    assert all(t["description"] == "" for t in types)
+    assert all(t["long_description"] == "" for t in types)
+
+
+def test_load_type_info_returns_none_for_missing_registry():
+    """load_type_info() returns None when no registry directory has the file."""
+    from registry_loader import load_type_info
+    assert load_type_info([], "advisory") is None
+    assert load_type_info(["/nonexistent/path"], "advisory") is None
