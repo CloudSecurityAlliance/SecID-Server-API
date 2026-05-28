@@ -170,6 +170,57 @@ def load_single(store: Store, registry_dirs: list[str], secid_type: str, namespa
     return None
 
 
+def load_type_info(registry_dirs: list[str], secid_type: str) -> Optional[dict]:
+    """Read registry/<secid_type>.json from the first registry dir that has it.
+
+    Returns the parsed type-level metadata (description, purpose, format,
+    examples, etc.) or None if no registry directory has the file.
+
+    Used by the resolver for bare-type queries (e.g., secid:advisory) in
+    lazy mode, where the full type index isn't pre-built. Also used by
+    list_all_types() to assemble the /api/v1/types response.
+    """
+    for registry_dir in registry_dirs:
+        type_file = Path(registry_dir) / f"{secid_type}.json"
+        if type_file.exists():
+            try:
+                return json.loads(type_file.read_text())
+            except json.JSONDecodeError as e:
+                logger.warning(f"Error parsing {type_file}: {e}")
+    return None
+
+
+def list_all_types(registry_dirs: list[str]) -> list[dict]:
+    """Return metadata for all 10 SecID types in canonical order.
+
+    Each entry has the shape:
+        {
+            "type": "advisory",
+            "description": "<short description from registry/advisory.json>",
+            "long_description": "<purpose field, same source>",
+            "subtypes": []   # Python Server-API doesn't yet enumerate subtype
+                             # descriptions; that data lives in SecID-Service's
+                             # type-registry.ts. Future work: centralize a
+                             # type-registry.json in the SecID spec repo so
+                             # all implementations read from one canonical source.
+        }
+
+    Types with no registry/<type>.json file get empty description fields
+    rather than being omitted — the type list itself is canonical (always 10)
+    even if metadata is missing.
+    """
+    out: list[dict] = []
+    for secid_type in SECID_TYPES:
+        info = load_type_info(registry_dirs, secid_type) or {}
+        out.append({
+            "type": secid_type,
+            "description": info.get("description", ""),
+            "long_description": info.get("purpose", info.get("description", "")),
+            "subtypes": [],
+        })
+    return out
+
+
 def update_load(store: Store, registry_dirs: list[str], since_commit: Optional[str] = None) -> int:
     """Reload only files changed since a given commit. Returns count updated.
 

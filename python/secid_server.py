@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from storage import create_store
-from registry_loader import bulk_load, SECID_TYPES
+from registry_loader import bulk_load, list_all_types, SECID_TYPES
 from resolver import resolve
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,21 @@ def create_app(config: ServerConfig) -> FastAPI:
                 if "url" not in r or r.get("parsability") == parsability
             ]
         return JSONResponse(content=result)
+
+    @app.get("/api/v1/types")
+    async def api_types():
+        """Return the canonical SecID type list with descriptions.
+
+        Mirrors the same endpoint on SecID-Service. Type metadata comes from
+        registry/<type>.json in the configured registry directories.
+
+        Note: subtype declarations live in SecID-Service's type-registry.ts
+        today (not yet centralized in the spec repo's registry data), so the
+        `subtypes` array is always empty here. Clients that need subtype
+        descriptions should query SecID-Service directly until centralization
+        lands.
+        """
+        return JSONResponse(content={"types": list_all_types(config.registry_dirs)})
 
     @app.post("/admin/reload")
     async def admin_reload():
