@@ -342,3 +342,25 @@ def test_cross_source_search_no_registry():
     from storage import create_store
     store = create_store("memory")
     assert _cross_source_search(store, "advisory", "CVE-2021-44228", None) == []
+
+
+# ---------------------------------------------------------------------------
+# Resolved-URL authority validation (F-07-01)
+# ---------------------------------------------------------------------------
+
+
+def test_substitute_drops_authority_injection():
+    """A value that changes the template's host/scheme yields None (dropped)."""
+    from resolver import _substitute_url_template
+    assert _substitute_url_template("https://{id}.example.com/", {}, "evil.com") is None
+    assert _substitute_url_template("https://{id}/path", {}, "evil.com") is None
+
+
+def test_substitute_preserves_reserved_chars_on_same_host():
+    """Reserved chars (e.g. ':') in a path-position ID are preserved, not mangled,
+    and the result is returned because the host is unchanged."""
+    from resolver import _substitute_url_template
+    assert (
+        _substitute_url_template("https://access.redhat.com/errata/{id}", {}, "RHSA-2024:1234")
+        == "https://access.redhat.com/errata/RHSA-2024:1234"
+    )
