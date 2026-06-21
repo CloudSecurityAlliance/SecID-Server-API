@@ -6,6 +6,7 @@ walk the match_nodes tree, and return the result.
 
 import json
 import re
+import urllib.parse
 from typing import Optional
 
 from registry_loader import SECID_TYPES, _reject_unsafe_segment
@@ -22,7 +23,34 @@ def _add_format_metadata(result: dict, data: dict) -> None:
             result[field] = data[field]
 
 
-def _substitute_url_template(template: str, child_data: dict, captured_input: str) -> str:
+_ALLOWED_URL_SCHEMES = ("https", "http")
+
+
+def _validate_resolved_url(template: str, url: str) -> Optional[str]:
+    """Return url unless substitution changed the template's scheme/authority.
+
+    The open-redirect primitive (F-07-01) is the resolved host/scheme changing.
+    Read the template's literal authority by neutralizing {placeholders}, then
+    require the assembled URL's scheme + netloc to match. Path/query content on
+    the template's own host is left intact, so identifiers that legitimately
+    contain ':' etc. are unaffected. Returns None (caller drops to a
+    description-only result) on a scheme/host change; non-absolute templates
+    have no authority to enforce and pass through.
+    """
+    tpl = urllib.parse.urlsplit(re.sub(r"\{[^}]*\}", "x", template))
+    if not tpl.netloc:
+        return url
+    res = urllib.parse.urlsplit(url)
+    if res.scheme not in _ALLOWED_URL_SCHEMES:
+        return None
+    if res.scheme != tpl.scheme:
+        return None
+    if res.netloc != tpl.netloc:
+        return None
+    return url
+
+
+def _substitute_url_template(template: str, child_data: dict, captured_input: str) -> Optional[str]:
     """Substitute {var} placeholders in a URL template.
 
     Two substitution modes coexist:
@@ -61,11 +89,13 @@ def _substitute_url_template(template: str, child_data: dict, captured_input: st
     # Mode 2: implicit {id} default
     variables.setdefault("id", captured_input)
 
-    # Apply substitution
+    # Apply substitution. Values are kept verbatim — identifiers legitimately
+    # contain ':' and other reserved chars; the authority check below (not
+    # encoding) is what prevents an open redirect.
     url = template
     for name, value in variables.items():
         url = url.replace("{" + name + "}", value)
-    return url
+    return _validate_resolved_url(template, url)
 
 
 def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> dict:
@@ -312,10 +342,14 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                         if child.get("weight"):
                             result["weight"] = child["weight"]
                         url_template = child_data.get("url")
-                        if url_template:
+                        resolved_url = (
+                            _substitute_url_template(url_template, child_data, subpath)
+                            if url_template else None
+                        )
+                        if resolved_url:
                             # URL-bearing result: substitute {var} placeholders;
                             # do NOT include `data` block (canonical contract).
-                            result["url"] = _substitute_url_template(url_template, child_data, subpath)
+                            result["url"] = resolved_url
                             _add_format_metadata(result, child_data)
                         else:
                             # Description-only result: include `data` block
@@ -342,8 +376,12 @@ def _build_node_result(node: dict, subpath: Optional[str], version: Optional[str
                         if child.get("weight"):
                             result["weight"] = child["weight"]
                         url_template = child_data.get("url")
-                        if url_template:
-                            result["url"] = _substitute_url_template(url_template, child_data, version)
+                        resolved_url = (
+                            _substitute_url_template(url_template, child_data, version)
+                            if url_template else None
+                        )
+                        if resolved_url:
+                            result["url"] = resolved_url
                             _add_format_metadata(result, child_data)
                         else:
                             _add_format_metadata(result, child_data)
@@ -573,10 +611,12 @@ def _cross_source_search(
                 if child.get("weight"):
                     result["weight"] = child["weight"]
                 url_template = child_data.get("url")
-                if url_template:
-                    result["url"] = _substitute_url_template(
-                        url_template, child_data, search_term
-                    )
+                resolved_url = (
+                    _substitute_url_template(url_template, child_data, search_term)
+                    if url_template else None
+                )
+                if resolved_url:
+                    result["url"] = resolved_url
                     _add_format_metadata(result, child_data)
                 results.append(result)
                 # One child match per source-level node is enough; don't
