@@ -24,6 +24,39 @@ SECID_TYPES = [
 ]
 
 
+def _reject_unsafe_segment(value: Optional[str]) -> bool:
+    """Return True if a namespace/subpath segment is unsafe to join into a path.
+
+    Rejects parent-dir traversal ('..'), absolute paths, backslashes, and NUL.
+    Namespace/subpath segments are derived from the untrusted query string, and
+    pathlib's '/' join does NOT collapse '..', so a crafted namespace could
+    otherwise escape the registry tree (arbitrary .json read / existence oracle).
+    """
+    if not value:
+        return False
+    if "\x00" in value or "\\" in value:
+        return True
+    if value.startswith("/"):
+        return True
+    return any(part == ".." for part in value.split("/"))
+
+
+def _contained_path(registry_dir: str, full_path: Path) -> Optional[Path]:
+    """Return full_path iff it resolves inside registry_dir, else None.
+
+    Resolves symlinks and collapses '..' on both sides, then confirms the
+    target stays within the registry root. Fails closed (None) on escape or
+    any resolution error, so callers treat it as 'file not present'.
+    """
+    try:
+        base = Path(registry_dir).resolve()
+        target = full_path.resolve()
+        target.relative_to(base)  # raises ValueError if outside base
+    except (ValueError, OSError):
+        return None
+    return target
+
+
 def find_registry_json_files(registry_dirs: list[str]) -> list[Path]:
     """Find all .json registry files across one or more registry directories.
 
@@ -88,8 +121,8 @@ def build_type_index(store: Store, registry_dirs: list[str]) -> None:
         # Load type-level JSON if it exists
         type_json = None
         for registry_dir in registry_dirs:
-            type_file = Path(registry_dir) / f"{secid_type}.json"
-            if type_file.exists():
+            type_file = _contained_path(registry_dir, Path(registry_dir) / f"{secid_type}.json")
+            if type_file and type_file.exists():
                 type_json = json.loads(type_file.read_text())
                 break
 
@@ -144,6 +177,11 @@ def bulk_load(store: Store, registry_dirs: list[str]) -> int:
 
 def load_single(store: Store, registry_dirs: list[str], secid_type: str, namespace: str) -> Optional[dict]:
     """Lazy load a single namespace entry. Returns the data or None."""
+    # Reject hostile namespaces before they reach the filesystem join.
+    if _reject_unsafe_segment(namespace):
+        logger.warning(f"Rejected unsafe namespace: {namespace!r}")
+        return None
+
     # Convert namespace to filesystem path: redhat.com → com/redhat.json
     parts = namespace.split("/", 1)
     domain = parts[0]
@@ -157,8 +195,10 @@ def load_single(store: Store, registry_dirs: list[str], secid_type: str, namespa
     fs_path += ".json"
 
     for registry_dir in reversed(registry_dirs):  # later dirs take priority
-        full_path = Path(registry_dir) / secid_type / fs_path
-        if full_path.exists():
+        # Defense in depth: confirm the joined path stays inside the registry
+        # tree even if a hostile segment slipped past the check above.
+        full_path = _contained_path(registry_dir, Path(registry_dir) / secid_type / fs_path)
+        if full_path and full_path.exists():
             try:
                 data = json.loads(full_path.read_text())
                 key = build_namespace_key(data)
@@ -180,9 +220,12 @@ def load_type_info(registry_dirs: list[str], secid_type: str) -> Optional[dict]:
     lazy mode, where the full type index isn't pre-built. Also used by
     list_all_types() to assemble the /api/v1/types response.
     """
+    if _reject_unsafe_segment(secid_type):
+        logger.warning(f"Rejected unsafe type: {secid_type!r}")
+        return None
     for registry_dir in registry_dirs:
-        type_file = Path(registry_dir) / f"{secid_type}.json"
-        if type_file.exists():
+        type_file = _contained_path(registry_dir, Path(registry_dir) / f"{secid_type}.json")
+        if type_file and type_file.exists():
             try:
                 return json.loads(type_file.read_text())
             except json.JSONDecodeError as e:

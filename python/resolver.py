@@ -9,7 +9,7 @@ import re
 import urllib.parse
 from typing import Optional
 
-from registry_loader import SECID_TYPES
+from registry_loader import SECID_TYPES, _reject_unsafe_segment
 from storage import Store
 
 # Format metadata fields lifted from child data to top-level result
@@ -242,6 +242,12 @@ def _match_namespace(store: Store, secid_type: str, path: str,
 
     Returns (namespace, remaining_name) or (None, None).
     """
+    # Boundary check: reject traversal/absolute/NUL before any candidate
+    # namespace reaches the lazy loader's filesystem join. Returning
+    # (None, None) flows into the existing not_found path — no error oracle.
+    if _reject_unsafe_segment(path):
+        return None, None
+
     segments = path.split("/")
     best_namespace = None
     best_name = None

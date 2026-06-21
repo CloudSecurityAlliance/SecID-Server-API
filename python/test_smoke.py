@@ -364,3 +364,78 @@ def test_substitute_preserves_reserved_chars_on_same_host():
         _substitute_url_template("https://access.redhat.com/errata/{id}", {}, "RHSA-2024:1234")
         == "https://access.redhat.com/errata/RHSA-2024:1234"
     )
+
+
+# ---------------------------------------------------------------------------
+# Path-traversal containment (F-05-01 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_reject_unsafe_segment():
+    """The segment guard rejects traversal/absolute/NUL but allows dotted labels."""
+    from registry_loader import _reject_unsafe_segment
+    assert _reject_unsafe_segment("a/../b") is True
+    assert _reject_unsafe_segment("../etc") is True
+    assert _reject_unsafe_segment("/etc/passwd") is True
+    assert _reject_unsafe_segment("a\\b") is True
+    assert _reject_unsafe_segment("a\x00b") is True
+    # Legitimate: dots inside a label are fine; only '..' *segments* are rejected.
+    assert _reject_unsafe_segment("redhat.com") is False
+    assert _reject_unsafe_segment("legislation.gov.uk/advisories") is False
+    assert _reject_unsafe_segment("a..b") is False
+    assert _reject_unsafe_segment(None) is False
+
+
+def test_contained_path(tmp_path):
+    """_contained_path returns an in-tree path but None for an escape."""
+    from registry_loader import _contained_path
+    base = tmp_path / "registry"
+    (base / "advisory" / "com").mkdir(parents=True)
+    legit = base / "advisory" / "com" / "redhat.json"
+    legit.write_text("{}")
+    assert _contained_path(str(base), legit) == legit.resolve()
+    secret = tmp_path / "secret.json"
+    secret.write_text("{}")
+    escape = base / "advisory" / "com" / "redhat" / ".." / ".." / ".." / ".." / "secret.json"
+    assert _contained_path(str(base), escape) is None
+
+
+def _make_registry(tmp_path):
+    """Minimal registry with one legit namespace + a secret file OUTSIDE the root."""
+    import json
+    base = tmp_path / "registry"
+    (base / "advisory" / "com").mkdir(parents=True)
+    (base / "advisory" / "com" / "redhat.json").write_text(json.dumps({
+        "type": "advisory", "namespace": "redhat.com", "match_nodes": [],
+    }))
+    secret = tmp_path / "secret.json"
+    secret.write_text(json.dumps({
+        "type": "advisory", "namespace": "secret.internal", "data": "TOPSECRET",
+    }))
+    return str(base), secret
+
+
+def test_load_single_blocks_traversal(tmp_path):
+    """A traversal namespace must not read a .json outside the registry root."""
+    from registry_loader import load_single
+    from storage import create_store
+    reg, _secret = _make_registry(tmp_path)
+    store = create_store("memory")
+    # Legit namespace still loads (the fix must not break normal use).
+    assert load_single(store, [reg], "advisory", "redhat.com") is not None
+    # Traversal to the out-of-tree secret returns None (not the secret).
+    assert load_single(store, [reg], "advisory", "redhat.com/../../../../secret") is None
+    # The secret's content never entered the store.
+    assert all("TOPSECRET" not in (store.get(k) or "") for k in store.keys())
+
+
+def test_resolve_traversal_is_not_found(tmp_path):
+    """End-to-end: a traversal query resolves to not-found, never the secret."""
+    import json
+    from resolver import resolve
+    from storage import create_store
+    reg, _secret = _make_registry(tmp_path)
+    store = create_store("memory")
+    resp = resolve(store, "secid:advisory/redhat.com/../../../../secret", registry_dirs=[reg])
+    assert resp["status"] != "found"
+    assert "TOPSECRET" not in json.dumps(resp)
