@@ -25,6 +25,20 @@ def _add_format_metadata(result: dict, data: dict) -> None:
 
 _ALLOWED_URL_SCHEMES = ("https", "http")
 
+# ReDoS runtime bound. Registry-authored regexes (patterns[], variables.*.extract)
+# run against attacker-controlled input on every request via Python `re` — no RE2
+# backing, no timeout. Capping input length is the minimal stopgap: catastrophic
+# backtracking is super-linear in input size, so a hard cap bounds worst-case CPU.
+# FastAPI's `secid: str = Query(...)` is otherwise UNBOUNDED. (RE2 is the robust
+# follow-up; see audit Patch 09.)
+MAX_SECID_QUERY_CHARS = 1024  # whole query; real SecIDs are < 200 chars
+MAX_REGEX_INPUT = 256         # per-component (name / subpath / version / search term)
+
+
+def _too_long_for_regex(*values: Optional[str]) -> bool:
+    """True if any value exceeds the per-component ReDoS bound (None is fine)."""
+    return any(v is not None and len(v) > MAX_REGEX_INPUT for v in values)
+
 
 def _validate_resolved_url(template: str, url: str) -> Optional[str]:
     """Return url unless substitution changed the template's scheme/authority.
@@ -100,6 +114,10 @@ def _substitute_url_template(template: str, child_data: dict, captured_input: st
 
 def resolve(store: Store, secid_query: str, registry_dirs: list[str] = None) -> dict:
     """Resolve a SecID string. Returns the API response envelope."""
+    # ReDoS guard (see MAX_SECID_QUERY_CHARS): reject pathologically long input
+    # before any regex runs. FastAPI's Query(...) does not bound length itself.
+    if len(secid_query) > MAX_SECID_QUERY_CHARS:
+        return _error(secid_query[:MAX_SECID_QUERY_CHARS], "Query too long")
     secid_query = secid_query.strip()
 
     # Strip scheme
@@ -276,6 +294,13 @@ def _walk_match_nodes(nodes: list, name: str, subpath: Optional[str],
                        namespace: str, ns_data: dict) -> list[dict]:
     """Walk the match_nodes tree to find matching entries."""
     results = []
+
+    # ReDoS guard: a legitimate component is far under MAX_REGEX_INPUT, so
+    # refusing to run the registry regex on an over-long name/subpath/version
+    # (treated as no-match) bounds worst-case backtracking without affecting
+    # any valid resolution.
+    if _too_long_for_regex(name, subpath, version):
+        return results
 
     # If we have a name, match it against top-level nodes
     if name:
@@ -568,7 +593,7 @@ def _cross_source_search(
     (rare in current registry data) are not traversed by cross-source.
     The Worker's equivalent behavior is the canonical reference.
     """
-    if not search_term:
+    if not search_term or _too_long_for_regex(search_term):
         return []
 
     results: list[dict] = []

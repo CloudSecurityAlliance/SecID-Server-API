@@ -22,6 +22,7 @@ Serves:
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -64,6 +65,13 @@ class ServerConfig:
     storage_type: str = "memory"
     storage_kwargs: dict = field(default_factory=dict)
     load_mode: str = "lazy"
+    # Reload-specific token (NOT a master key). Required for POST /admin/reload;
+    # None/empty => the endpoint is disabled (always 401). Set via --reload-token
+    # or the SECID_RELOAD_TOKEN environment variable.
+    reload_token: Optional[str] = None
+    # Explicit CORS allowlist. Empty => CORS middleware is not added at all
+    # (no Access-Control-Allow-Origin header; browsers block cross-origin reads).
+    cors_origins: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +99,41 @@ def create_app(config: ServerConfig) -> FastAPI:
         version="0.1.0",
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    # CORS is opt-in: with no configured origins the middleware is not added,
+    # so no Access-Control-Allow-Origin header is sent (browsers block
+    # cross-origin reads). Operators opt in via --cors-origin / SECID_CORS_ORIGINS.
+    if config.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.cors_origins,
+            allow_methods=["GET", "POST"],
+            allow_headers=["*"],
+        )
+        logger.info(f"CORS enabled for origins: {config.cors_origins}")
+    else:
+        logger.info("CORS disabled (no --cors-origin configured)")
+
+    def require_reload_token(x_reload_token: Optional[str] = Header(default=None)) -> None:
+        """Gate POST /admin/reload behind its dedicated reload token.
+
+        Fail closed: 401 when no reload token is configured server-side, or when
+        the presented X-Reload-Token header does not match. Constant-time compare
+        avoids leaking the token via timing. This dependency guards ONLY the
+        reload capability — do not reuse it for other admin routes; give each its
+        own SECID_<CAP>_TOKEN.
+        """
+        expected = config.reload_token
+        if not expected:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="/admin/reload disabled: no reload token configured "
+                       "(set SECID_RELOAD_TOKEN / --reload-token)",
+            )
+        if not x_reload_token or not hmac.compare_digest(x_reload_token, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid or missing X-Reload-Token",
+            )
 
     @app.get("/api/v1/resolve")
     async def api_resolve(
@@ -130,9 +167,9 @@ def create_app(config: ServerConfig) -> FastAPI:
         """
         return JSONResponse(content={"types": list_all_types(config.registry_dirs)})
 
-    @app.post("/admin/reload")
+    @app.post("/admin/reload", dependencies=[Depends(require_reload_token)])
     async def admin_reload():
-        """Reload registry data (after git pull)."""
+        """Reload registry data (after git pull). Requires X-Reload-Token."""
         from registry_loader import update_load
         count = update_load(store, config.registry_dirs)
         return {"reloaded": count}
@@ -214,6 +251,12 @@ def _try_mount_mcp(app: FastAPI, store, config: ServerConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _default_cors_origins() -> list[str]:
+    """CORS allowlist from SECID_CORS_ORIGINS (comma-separated). Empty if unset."""
+    raw = os.environ.get("SECID_CORS_ORIGINS", "")
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SecID Self-Hosted Server")
     parser.add_argument(
@@ -225,7 +268,22 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--memcached-url", default="localhost:11211")
     parser.add_argument("--sqlite-path", default=":memory:")
     parser.add_argument("--load", default="lazy", choices=["lazy", "bulk"])
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Interface to bind. Defaults to loopback. Pass 0.0.0.0 to expose on "
+             "all interfaces (only behind a trusted network/proxy + a reload token).",
+    )
+    parser.add_argument(
+        "--reload-token", default=os.environ.get("SECID_RELOAD_TOKEN"),
+        help="Token required for POST /admin/reload (or SECID_RELOAD_TOKEN env). "
+             "Scoped to reload only. Unset => /admin/reload disabled (401).",
+    )
+    parser.add_argument(
+        "--cors-origin", action="append", default=_default_cors_origins(),
+        dest="cors_origins", metavar="ORIGIN",
+        help="Browser origin allowed to call the API cross-origin (repeatable, "
+             "or SECID_CORS_ORIGINS comma-separated). Default: none.",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args(argv)
@@ -281,9 +339,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         storage_type=args.storage,
         storage_kwargs=_build_storage_kwargs(args),
         load_mode=args.load,
+        reload_token=args.reload_token,
+        cors_origins=args.cors_origins,
     )
 
     app = create_app(config)
+
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.reload_token:
+        logger.warning(
+            "Binding to %s exposes this server on all interfaces. /admin/reload "
+            "is disabled (no SECID_RELOAD_TOKEN set) but the read API is "
+            "world-reachable. Set --reload-token to enable reload, and place it "
+            "behind a trusted network/proxy.",
+            args.host,
+        )
 
     import uvicorn
     logger.info(f"Starting SecID server on {args.host}:{args.port}")

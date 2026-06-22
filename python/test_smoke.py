@@ -439,3 +439,88 @@ def test_resolve_traversal_is_not_found(tmp_path):
     resp = resolve(store, "secid:advisory/redhat.com/../../../../secret", registry_dirs=[reg])
     assert resp["status"] != "found"
     assert "TOPSECRET" not in json.dumps(resp)
+
+
+# ---------------------------------------------------------------------------
+# Safe-by-default server: reload token, CORS allowlist (F-06-01, F-06-02, F-06-03)
+# ---------------------------------------------------------------------------
+
+
+def _app_with(**kwargs):
+    return create_app(ServerConfig(registry_dirs=[], storage_type="memory", **kwargs))
+
+
+def test_admin_reload_disabled_without_token():
+    """No reload token configured => POST /admin/reload fails closed with 401,
+    before any reload runs. This is the F-06-01 fix (was unauth)."""
+    client = TestClient(_empty_app())
+    resp = client.post("/admin/reload")
+    assert resp.status_code == 401
+    assert "no reload token" in resp.json()["detail"].lower()
+
+
+def test_admin_reload_rejects_wrong_token():
+    """Token configured, missing/wrong X-Reload-Token => 401."""
+    client = TestClient(_app_with(reload_token="s3cret"))
+    assert client.post("/admin/reload").status_code == 401  # missing header
+    assert client.post("/admin/reload", headers={"X-Reload-Token": "wrong"}).status_code == 401
+
+
+def test_admin_reload_accepts_correct_token():
+    """Token configured + matching X-Reload-Token => handler runs (200)."""
+    client = TestClient(_app_with(reload_token="s3cret"))
+    resp = client.post("/admin/reload", headers={"X-Reload-Token": "s3cret"})
+    assert resp.status_code == 200
+    assert "reloaded" in resp.json()
+
+
+def test_read_endpoints_need_no_token():
+    """The read path stays anonymous by design — the token guards only reload."""
+    client = TestClient(_app_with(reload_token="s3cret"))
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/v1/resolve?secid=secid:advisory/x").status_code == 200
+
+
+def test_cors_disabled_by_default():
+    """No --cors-origin configured => no Access-Control-Allow-Origin header."""
+    client = TestClient(_empty_app())
+    resp = client.get("/health", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in {k.lower() for k in resp.headers}
+
+
+def test_cors_enabled_for_configured_origin():
+    """An explicitly allowlisted origin gets the CORS header; others do not."""
+    client = TestClient(_app_with(cors_origins=["https://good.example"]))
+    ok = client.get("/health", headers={"Origin": "https://good.example"})
+    assert ok.headers.get("access-control-allow-origin") == "https://good.example"
+
+
+# ---------------------------------------------------------------------------
+# ReDoS runtime bound (F-03-02): cap untrusted input fed to registry regexes
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rejects_oversize_query():
+    """A query past MAX_SECID_QUERY_CHARS returns a clean error before any regex."""
+    from resolver import resolve, MAX_SECID_QUERY_CHARS
+    from storage import create_store
+    store = create_store("memory")
+    resp = resolve(store, "secid:advisory/" + "a" * (MAX_SECID_QUERY_CHARS + 10))
+    assert resp["status"] == "error"
+    assert "too long" in resp["message"].lower()
+
+
+def test_oversize_query_via_http():
+    """The cap is enforced through the HTTP layer too (FastAPI Query is unbounded)."""
+    from resolver import MAX_SECID_QUERY_CHARS
+    client = TestClient(_empty_app())
+    resp = client.get("/api/v1/resolve?secid=secid:advisory/" + "a" * (MAX_SECID_QUERY_CHARS + 10))
+    assert resp.status_code == 200  # envelope contract: always 200
+    assert resp.json()["status"] == "error"
+
+
+def test_too_long_for_regex_helper():
+    """Per-component bound: None and short values pass; an over-long one trips."""
+    from resolver import _too_long_for_regex, MAX_REGEX_INPUT
+    assert not _too_long_for_regex(None, "cve", "CVE-2021-44228")
+    assert _too_long_for_regex("a" * (MAX_REGEX_INPUT + 1))

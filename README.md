@@ -73,11 +73,25 @@ Update loading uses git to detect changes:
 # Pull latest registry data
 cd /path/to/SecID && git pull
 
-# Tell the server to reload changes
-curl -X POST http://localhost:8000/admin/reload
+# Tell the server to reload changes. /admin/reload is gated by a dedicated
+# reload token — set SECID_RELOAD_TOKEN (or --reload-token) when starting the
+# server, then send it in the X-Reload-Token header. With no token configured
+# the endpoint is disabled (returns 401).
+curl -X POST http://localhost:8000/admin/reload -H "X-Reload-Token: $SECID_RELOAD_TOKEN"
 ```
 
 Or run with `--watch` to auto-detect file changes.
+
+## Security & Exposure Defaults
+
+This reference server is **safe-by-default**:
+
+- **Binds to loopback (`127.0.0.1`) by default.** To serve other hosts, pass `--host 0.0.0.0` explicitly — and only behind a trusted network or reverse proxy. Front it with TLS so the reload token isn't sent in cleartext.
+- **`/admin/reload` is disabled unless you set a reload token** (`SECID_RELOAD_TOKEN` / `--reload-token`, sent as the `X-Reload-Token` header), compared in constant time. The token is scoped to reload only — give any future admin endpoint its own token rather than widening this one. The read path (`/api/v1/resolve`, `/api/v1/types`, `/mcp`) is anonymous by design.
+- **CORS is off by default.** No `Access-Control-Allow-Origin` header is sent unless you allowlist origins with `--cors-origin <origin>` (repeatable) or `SECID_CORS_ORIGINS` (comma-separated).
+- **Untrusted input is length-capped** before it reaches registry regexes (a ReDoS bound; real SecIDs are well under it).
+
+> **Upgrading from an earlier build?** The old defaults were `--host 0.0.0.0` and an unauthenticated `/admin/reload`. After this change you must (a) pass `--host 0.0.0.0` to keep listening on all interfaces, (b) set a reload token to use `/admin/reload` at all, and (c) pass `--cors-origin` if browser clients call the API cross-origin.
 
 ## API Compatibility
 
