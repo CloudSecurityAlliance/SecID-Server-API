@@ -57,6 +57,16 @@ def _contained_path(registry_dir: str, full_path: Path) -> Optional[Path]:
     return target
 
 
+def _canonical_type(secid_type: Optional[str]) -> Optional[str]:
+    """The SECID_TYPES entry equal to secid_type, or None.
+
+    Returns the constant from SECID_TYPES rather than the caller's string, so
+    a value that originated in a query never reaches a filesystem path - only
+    one of the ten fixed type names can.
+    """
+    return next((t for t in SECID_TYPES if t == secid_type), None)
+
+
 def _is_namespace_file(rel: Path) -> bool:
     """True for registry/<type>/**/<name>.json namespace files.
 
@@ -81,6 +91,9 @@ def load_namespaces(registry_dirs: list[str], secid_type: str) -> dict[str, dict
     'uk/gov/legislation.json' is ambiguous, the field is not.
     """
     found: dict[str, dict] = {}
+    secid_type = _canonical_type(secid_type)
+    if secid_type is None:
+        return found
     for registry_dir in registry_dirs:
         root = Path(registry_dir)
         type_dir = root / secid_type
@@ -291,9 +304,11 @@ def load_type_info(registry_dirs: list[str], secid_type: str) -> Optional[dict]:
     lazy mode, where the full type index isn't pre-built. Also used by
     list_all_types() to assemble the /api/v1/types response.
     """
-    if _reject_unsafe_segment(secid_type):
-        logger.warning(f"Rejected unsafe type: {secid_type!r}")
+    canonical = _canonical_type(secid_type)
+    if canonical is None:
+        logger.warning(f"Rejected unknown type: {secid_type!r}")
         return None
+    secid_type = canonical
     for registry_dir in registry_dirs:
         try:
             type_file = _contained_path(registry_dir, Path(registry_dir) / f"{secid_type}.json")

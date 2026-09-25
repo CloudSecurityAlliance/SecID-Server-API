@@ -576,7 +576,8 @@ def test_overlay_bulk_load_and_load_single_agree(tmp_path):
     load_single(lazy_store, dirs, "advisory", "example.org")
     key = "secid:advisory/example.org"
     assert json.loads(bulk_store.get(key)) == json.loads(lazy_store.get(key))
-    assert "private.example.org" in bulk_store.get(key)
+    child = json.loads(bulk_store.get(key))["match_nodes"][0]["children"][0]
+    assert child["data"]["url"] == "https://private.example.org/{id}"
 
 
 # ---------------------------------------------------------------------------
