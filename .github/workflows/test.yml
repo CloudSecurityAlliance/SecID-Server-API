@@ -60,7 +60,8 @@ jobs:
         working-directory: python
         run: |
           pip install -r requirements.txt
-          pip install pytest httpx
+          # mcp is optional at runtime; installed here so the /mcp tests run.
+          pip install pytest httpx mcp
       - name: Run tests
         working-directory: python
         run: pytest -v -rs
