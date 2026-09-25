@@ -163,4 +163,6 @@ No changelog file needed — `git log` and `git diff` tell you exactly what chan
 
 ## License
 
-[CC0 1.0 Universal](LICENSE) — Public Domain Dedication
+[Apache License 2.0](LICENSE) — Copyright 2026 Cloud Security Alliance.
+
+The SecID registry data this server loads is published separately under CC0 in the [SecID](https://github.com/CloudSecurityAlliance/SecID) repository.
