@@ -35,8 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from storage import create_store
-from registry_loader import bulk_load, list_all_types, SECID_TYPES
-from resolver import resolve
+from registry_loader import bulk_load, list_all_types, loaded_commits, update_load
+from resolver import RegistryIndex
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +86,21 @@ def create_app(config: ServerConfig) -> FastAPI:
     Has no module-level side effects, so importing this file is safe.
     """
     store = create_store(config.storage_type, **config.storage_kwargs)
+    # One index per app: per-type namespace data, read from disk once per type
+    # (lazy) or up front (bulk), instead of re-reading files on every query.
+    index = RegistryIndex(store, config.registry_dirs)
+    # Commit each registry dir was loaded at; /admin/reload diffs against it.
+    commits = loaded_commits(config.registry_dirs)
 
     if config.load_mode == "bulk":
         count = bulk_load(store, config.registry_dirs)
+        index.preload()
         logger.info(f"Bulk loaded {count} namespaces into {config.storage_type} store")
     else:
         logger.info(f"Lazy loading from {config.registry_dirs} with {config.storage_type} store")
+
+    def run_resolve(secid: str) -> dict:
+        return index.resolve(secid)
 
     app = FastAPI(
         title="SecID Server",
@@ -135,8 +144,11 @@ def create_app(config: ServerConfig) -> FastAPI:
                 detail="invalid or missing X-Reload-Token",
             )
 
+    # Handlers are plain `def`, not `async def`: resolution does blocking file
+    # I/O (first use of a type) and CPU-bound regex matching, and FastAPI runs
+    # sync handlers in its threadpool instead of on the event loop.
     @app.get("/api/v1/resolve")
-    async def api_resolve(
+    def api_resolve(
         secid: str = Query(..., description="SecID string to resolve"),
         parsability: Optional[str] = Query(
             None,
@@ -144,7 +156,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         ),
     ):
         """Resolve a SecID string to URLs and registry data."""
-        result = resolve(store, secid, registry_dirs=config.registry_dirs)
+        result = run_resolve(secid)
         if parsability and "results" in result:
             result["results"] = [
                 r for r in result["results"]
@@ -153,7 +165,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         return JSONResponse(content=result)
 
     @app.get("/api/v1/types")
-    async def api_types():
+    def api_types():
         """Return the canonical SecID type list with descriptions.
 
         Mirrors the same endpoint on SecID-Service. Type metadata comes from
@@ -168,23 +180,27 @@ def create_app(config: ServerConfig) -> FastAPI:
         return JSONResponse(content={"types": list_all_types(config.registry_dirs)})
 
     @app.post("/admin/reload", dependencies=[Depends(require_reload_token)])
-    async def admin_reload():
-        """Reload registry data (after git pull). Requires X-Reload-Token."""
-        from registry_loader import update_load
-        count = update_load(store, config.registry_dirs)
+    def admin_reload():
+        """Reload registry data (after git pull). Requires X-Reload-Token.
+
+        Diffs each registry dir against the commit it was last loaded at, then
+        drops the resolver's cached index so the next query sees the changes.
+        """
+        count = update_load(store, config.registry_dirs, commits=commits)
+        index.invalidate()
         return {"reloaded": count}
 
     @app.get("/health")
-    async def health():
+    def health():
         """Health check — returns store type and current key count."""
         key_count = len(store.keys())
         return {"status": "ok", "store": config.storage_type, "keys": key_count}
 
-    _try_mount_mcp(app, store, config)
+    _try_mount_mcp(app, run_resolve)
     return app
 
 
-def _try_mount_mcp(app: FastAPI, store, config: ServerConfig) -> None:
+def _try_mount_mcp(app: FastAPI, run_resolve) -> None:
     """Mount /mcp endpoint if the `mcp` package is available.
 
     Same three tools as SecID-Service (resolve, lookup, describe). Optional
@@ -214,7 +230,7 @@ def _try_mount_mcp(app: FastAPI, store, config: ServerConfig) -> None:
           secid:ttp/mitre.org/attack#T1059.003          → ATT&CK technique URL
           secid:methodology/first.org/cvss@4.0          → CVSS v4.0 specification
         """
-        return json.dumps(resolve(store, secid, registry_dirs=config.registry_dirs), indent=2)
+        return json.dumps(run_resolve(secid), indent=2)
 
     @mcp.tool()
     def mcp_lookup(type: str, identifier: str) -> str:
@@ -226,7 +242,7 @@ def _try_mount_mcp(app: FastAPI, store, config: ServerConfig) -> None:
             identifier: The identifier to search for (e.g., CVE-2021-44228, CWE-79)
         """
         secid = f"secid:{type}/{identifier}"
-        return json.dumps(resolve(store, secid, registry_dirs=config.registry_dirs), indent=2)
+        return json.dumps(run_resolve(secid), indent=2)
 
     @mcp.tool()
     def mcp_describe(secid: str) -> str:
@@ -240,7 +256,7 @@ def _try_mount_mcp(app: FastAPI, store, config: ServerConfig) -> None:
         hash_idx = secid.find("#")
         if hash_idx != -1:
             secid = secid[:hash_idx]
-        return json.dumps(resolve(store, secid, registry_dirs=config.registry_dirs), indent=2)
+        return json.dumps(run_resolve(secid), indent=2)
 
     app.mount("/mcp", mcp.streamable_http_app())
     logger.info("MCP endpoint available at /mcp")

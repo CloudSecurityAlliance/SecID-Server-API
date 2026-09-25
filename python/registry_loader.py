@@ -1,9 +1,9 @@
 """Load SecID registry JSON files into a storage backend.
 
-Supports three loading strategies:
+Loading strategies:
 - bulk: load all entries at startup
-- lazy: load on first request (handled by resolver, not here)
-- update: reload only files changed since last sync
+- lazy: load on first request (the resolver builds a per-type index on first use)
+- update: after `git pull`, reload only namespaces changed since the last load
 """
 
 import json
@@ -57,13 +57,77 @@ def _contained_path(registry_dir: str, full_path: Path) -> Optional[Path]:
     return target
 
 
-def find_registry_json_files(registry_dirs: list[str]) -> list[Path]:
-    """Find all .json registry files across one or more registry directories.
+def _canonical_type(secid_type: Optional[str]) -> Optional[str]:
+    """The SECID_TYPES entry equal to secid_type, or None.
 
-    Later directories override earlier ones for the same namespace+type
-    (enables private registry overlays).
+    Returns the constant from SECID_TYPES rather than the caller's string, so
+    a value that originated in a query never reaches a filesystem path - only
+    one of the ten fixed type names can.
     """
-    files: dict[str, Path] = {}  # key → path (later wins)
+    return next((t for t in SECID_TYPES if t == secid_type), None)
+
+
+def _is_namespace_file(rel: Path) -> bool:
+    """True for registry/<type>/**/<name>.json namespace files.
+
+    Excludes type-level files (registry/<type>.json, one path part) and anything
+    under or named with a leading underscore (_template.json, _deferred/).
+    """
+    if rel.suffix != ".json" or len(rel.parts) < 3:
+        return False
+    return not any(part.startswith("_") for part in rel.parts)
+
+
+def load_namespaces(registry_dirs: list[str], secid_type: str) -> dict[str, dict]:
+    """Read every namespace file of one type, keyed by its `namespace` field.
+
+    Precedence is deterministic: registry_dirs are applied in order and a later
+    directory overrides an earlier one for the same namespace (a private overlay
+    listed after the public registry wins). Every loader uses this rule -
+    bulk_load, the resolver's per-type index, load_single, and update_load - so
+    which copy you get never depends on query order.
+
+    The `namespace` field inside the file is canonical, not the path: reversing
+    'uk/gov/legislation.json' is ambiguous, the field is not.
+    """
+    found: dict[str, dict] = {}
+    secid_type = _canonical_type(secid_type)
+    if secid_type is None:
+        return found
+    for registry_dir in registry_dirs:
+        root = Path(registry_dir)
+        type_dir = root / secid_type
+        if not type_dir.is_dir():
+            continue
+        for json_file in sorted(type_dir.rglob("*.json")):
+            if not _is_namespace_file(json_file.relative_to(root)):
+                continue
+            try:
+                data = json.loads(json_file.read_text())
+            except (OSError, ValueError) as e:
+                logger.warning(f"Skipping {json_file}: {e}")
+                continue
+            namespace = data.get("namespace") if isinstance(data, dict) else None
+            if not namespace:
+                logger.warning(f"Skipping {json_file}: no namespace field")
+                continue
+            if data.get("type") != secid_type:
+                logger.warning(
+                    f"Skipping {json_file}: type {data.get('type')!r} does not match "
+                    f"directory {secid_type!r}"
+                )
+                continue
+            found[namespace] = data
+    return found
+
+
+def find_registry_json_files(registry_dirs: list[str]) -> list[Path]:
+    """Find all namespace .json files across one or more registry directories.
+
+    Later directories override earlier ones for the same relative path.
+    Prefer load_namespaces(), which applies precedence by namespace.
+    """
+    files: dict[str, Path] = {}  # key -> path (later wins)
     for registry_dir in registry_dirs:
         root = Path(registry_dir)
         if not root.is_dir():
@@ -71,11 +135,8 @@ def find_registry_json_files(registry_dirs: list[str]) -> list[Path]:
             continue
         for json_file in sorted(root.rglob("*.json")):
             rel = json_file.relative_to(root)
-            # Skip type-level JSON (e.g., advisory.json, methodology.json)
-            # Skip templates and deferred
-            if "_" in json_file.stem or str(rel).count("/") < 2:
-                continue
-            files[str(rel)] = json_file
+            if _is_namespace_file(rel):
+                files[str(rel)] = json_file
     return list(files.values())
 
 
@@ -156,23 +217,41 @@ def build_type_index(store: Store, registry_dirs: list[str]) -> None:
 
 
 def bulk_load(store: Store, registry_dirs: list[str]) -> int:
-    """Load all registry JSON files into the store. Returns count loaded."""
-    files = find_registry_json_files(registry_dirs)
-    loaded = 0
+    """Load all registry JSON files into the store. Returns count loaded.
 
-    for json_file in files:
-        try:
-            data = json.loads(json_file.read_text())
-            key = build_namespace_key(data)
-            if key:
-                store.set(key, json.dumps(data))
-                loaded += 1
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Skipping {json_file}: {e}")
+    Keys already in the store that the registry no longer produces are evicted,
+    so a bulk load after files were deleted leaves no stale namespaces behind.
+    """
+    for registry_dir in registry_dirs:
+        if not Path(registry_dir).is_dir():
+            logger.warning(f"Registry directory not found: {registry_dir}")
+
+    expected: set[str] = set()
+    for secid_type in SECID_TYPES:
+        for namespace, data in load_namespaces(registry_dirs, secid_type).items():
+            key = f"secid:{secid_type}/{namespace}"
+            store.set(key, json.dumps(data))
+            expected.add(key)
+
+    for key in _namespace_keys(store):
+        if key not in expected:
+            store.delete(key)
 
     build_type_index(store, registry_dirs)
-    logger.info(f"Bulk loaded {loaded} namespaces from {len(registry_dirs)} registry dir(s)")
-    return loaded
+    logger.info(f"Bulk loaded {len(expected)} namespaces from {len(registry_dirs)} registry dir(s)")
+    return len(expected)
+
+
+def _namespace_keys(store: Store) -> list[str]:
+    """Store keys of the form secid:<type>/<namespace>."""
+    out = []
+    for key in store.keys():
+        if not key.startswith("secid:"):
+            continue
+        secid_type, sep, _ = key[len("secid:"):].partition("/")
+        if sep and secid_type in SECID_TYPES:
+            out.append(key)
+    return out
 
 
 def load_single(store: Store, registry_dirs: list[str], secid_type: str, namespace: str) -> Optional[dict]:
@@ -197,16 +276,21 @@ def load_single(store: Store, registry_dirs: list[str], secid_type: str, namespa
     for registry_dir in reversed(registry_dirs):  # later dirs take priority
         # Defense in depth: confirm the joined path stays inside the registry
         # tree even if a hostile segment slipped past the check above.
-        full_path = _contained_path(registry_dir, Path(registry_dir) / secid_type / fs_path)
-        if full_path and full_path.exists():
-            try:
-                data = json.loads(full_path.read_text())
-                key = build_namespace_key(data)
-                if key:
-                    store.set(key, json.dumps(data))
-                    return data
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Error loading {full_path}: {e}")
+        # OSError covers hostile-but-safe input such as a segment longer than
+        # the filesystem's name limit ("File name too long"): that is simply
+        # "not in the registry", never a 500.
+        try:
+            full_path = _contained_path(registry_dir, Path(registry_dir) / secid_type / fs_path)
+            if not (full_path and full_path.is_file()):
+                continue
+            data = json.loads(full_path.read_text())
+        except (OSError, ValueError) as e:
+            logger.debug(f"Cannot load {secid_type}/{namespace} from {registry_dir}: {e}")
+            continue
+        key = build_namespace_key(data)
+        if key:
+            store.set(key, json.dumps(data))
+            return data
     return None
 
 
@@ -220,16 +304,18 @@ def load_type_info(registry_dirs: list[str], secid_type: str) -> Optional[dict]:
     lazy mode, where the full type index isn't pre-built. Also used by
     list_all_types() to assemble the /api/v1/types response.
     """
-    if _reject_unsafe_segment(secid_type):
-        logger.warning(f"Rejected unsafe type: {secid_type!r}")
+    canonical = _canonical_type(secid_type)
+    if canonical is None:
+        logger.warning(f"Rejected unknown type: {secid_type!r}")
         return None
+    secid_type = canonical
     for registry_dir in registry_dirs:
-        type_file = _contained_path(registry_dir, Path(registry_dir) / f"{secid_type}.json")
-        if type_file and type_file.exists():
-            try:
+        try:
+            type_file = _contained_path(registry_dir, Path(registry_dir) / f"{secid_type}.json")
+            if type_file and type_file.is_file():
                 return json.loads(type_file.read_text())
-            except json.JSONDecodeError as e:
-                logger.warning(f"Error parsing {type_file}: {e}")
+        except (OSError, ValueError) as e:
+            logger.warning(f"Error reading {secid_type}.json in {registry_dir}: {e}")
     return None
 
 
@@ -264,67 +350,149 @@ def list_all_types(registry_dirs: list[str]) -> list[dict]:
     return out
 
 
-def update_load(store: Store, registry_dirs: list[str], since_commit: Optional[str] = None) -> int:
-    """Reload only files changed since a given commit. Returns count updated.
+# ---------------------------------------------------------------------------
+# Reload after `git pull`
+# ---------------------------------------------------------------------------
 
-    If since_commit is None, tries to use a stored marker.
-    Falls back to bulk load if git is unavailable.
+
+def _git(args: list[str], cwd: Path) -> Optional[str]:
+    """Run git and return stdout, or None if git is missing or the command fails."""
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def git_head(registry_dir: str) -> Optional[str]:
+    """Commit SHA checked out in the repo containing registry_dir, or None."""
+    out = _git(["rev-parse", "HEAD"], Path(registry_dir))
+    return out.strip() if out else None
+
+
+def loaded_commits(registry_dirs: list[str]) -> dict[str, Optional[str]]:
+    """Snapshot of the HEAD commit of each registry dir. Record this when the
+    registry is loaded and pass it to update_load() so a reload diffs against
+    what is actually loaded."""
+    return {d: git_head(d) for d in registry_dirs}
+
+
+def _changed_namespaces(registry_dir: str, base: str, head: str) -> Optional[set[tuple[str, str]]]:
+    """(type, namespace) pairs touched between two commits under registry_dir.
+
+    Handles A/M/T (read the new file), D (read the old blob with `git show`,
+    since the file is gone), and R/C (both sides) - `git diff -M` reports a
+    rename as "R100<TAB>old<TAB>new", which the old code mis-split into one
+    path. Returns None when git cannot answer (unknown base commit, not a
+    repo), which tells the caller to fall back to a full reload.
     """
-    for registry_dir in registry_dirs:
-        repo_root = Path(registry_dir).parent  # registry/ is inside the repo
-        if not (repo_root / ".git").exists():
-            logger.info(f"No git repo at {repo_root}, falling back to bulk load")
-            return bulk_load(store, registry_dirs)
+    reg = Path(registry_dir).resolve()
+    top_out = _git(["rev-parse", "--show-toplevel"], reg)
+    if not top_out:
+        return None
+    top = Path(top_out.strip()).resolve()
+    try:
+        rel_dir = reg.relative_to(top)
+    except ValueError:
+        return None
+    diff = _git(
+        ["diff", "--name-status", "-M", base, head, "--", str(rel_dir) or "."], top,
+    )
+    if diff is None:
+        return None
 
-    updated = 0
-    for registry_dir in registry_dirs:
-        repo_root = Path(registry_dir).parent
+    touched: set[tuple[str, str]] = set()
+
+    def note(rev: str, path: str) -> None:
         try:
-            if since_commit:
-                result = subprocess.run(
-                    ["git", "diff", "--name-status", since_commit, "HEAD", "--", "registry/"],
-                    capture_output=True, text=True, cwd=repo_root,
-                )
+            rel = Path(path).relative_to(rel_dir)
+        except ValueError:
+            return
+        if not _is_namespace_file(rel):
+            return
+        raw = _git(["show", f"{rev}:{path}"], top)
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get("namespace"):
+            touched.add((rel.parts[0], data["namespace"]))
+
+    for line in diff.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0][:1]
+        if status in ("R", "C") and len(parts) >= 3:
+            if status == "R":
+                note(base, parts[1])
+            note(head, parts[2])
+        elif status == "D":
+            note(base, parts[1])
+        elif status in ("A", "M", "T"):
+            note(head, parts[1])
+    return touched
+
+
+def _full_reload(store: Store, registry_dirs: list[str],
+                 commits: Optional[dict]) -> int:
+    count = bulk_load(store, registry_dirs)
+    if commits is not None:
+        commits.update(loaded_commits(registry_dirs))
+    return count
+
+
+def update_load(store: Store, registry_dirs: list[str], since_commit: Optional[str] = None,
+                commits: Optional[dict] = None) -> int:
+    """Reload namespaces changed since the registry was last loaded.
+
+    `commits` maps each registry dir to the commit it was last loaded at (see
+    loaded_commits()); it is updated in place to the new HEAD. `since_commit`
+    overrides the base commit for every dir. Changed namespaces - including
+    deletions and both sides of renames - are re-resolved against ALL registry
+    dirs, so overlay precedence holds and a namespace deleted from the private
+    overlay falls back to the public copy rather than disappearing.
+
+    Falls back to a full reload (which also evicts deleted namespaces) when a
+    dir is not in git, git is unavailable, or no base commit is known.
+
+    Returns the number of namespaces updated or removed.
+    """
+    touched: set[tuple[str, str]] = set()
+    heads: dict[str, str] = {}
+    for registry_dir in registry_dirs:
+        head = git_head(registry_dir)
+        base = since_commit or (commits or {}).get(registry_dir)
+        if not head or not base:
+            logger.info(f"No base commit for {registry_dir}; doing a full reload")
+            return _full_reload(store, registry_dirs, commits)
+        heads[registry_dir] = head
+        if base == head:
+            continue
+        changed = _changed_namespaces(registry_dir, base, head)
+        if changed is None:
+            logger.info(f"git diff {base}..{head} failed for {registry_dir}; doing a full reload")
+            return _full_reload(store, registry_dirs, commits)
+        touched |= changed
+
+    for secid_type in sorted({t for t, _ in touched if t in SECID_TYPES}):
+        current = load_namespaces(registry_dirs, secid_type)
+        for t, namespace in touched:
+            if t != secid_type:
+                continue
+            key = f"secid:{t}/{namespace}"
+            if namespace in current:
+                store.set(key, json.dumps(current[namespace]))
+                logger.info(f"Updated: {key}")
             else:
-                # Default: last 24 hours of changes
-                result = subprocess.run(
-                    ["git", "log", "--name-status", "--since=24 hours ago", "--pretty=format:", "--", "registry/"],
-                    capture_output=True, text=True, cwd=repo_root,
-                )
+                store.delete(key)
+                logger.info(f"Removed: {key}")
 
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-                parts = line.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                status, filepath = parts
-
-                if not filepath.endswith(".json") or "_" in Path(filepath).stem:
-                    continue
-
-                full_path = repo_root / filepath
-                if status in ("A", "M"):  # added or modified
-                    if full_path.exists():
-                        try:
-                            data = json.loads(full_path.read_text())
-                            key = build_namespace_key(data)
-                            if key:
-                                store.set(key, json.dumps(data))
-                                updated += 1
-                                logger.info(f"Updated: {key}")
-                        except (json.JSONDecodeError, KeyError) as e:
-                            logger.warning(f"Error loading {filepath}: {e}")
-                elif status == "D":  # deleted
-                    # Try to figure out the key from the path
-                    logger.info(f"Deleted: {filepath}")
-                    updated += 1
-
-        except FileNotFoundError:
-            logger.warning("git not found, falling back to bulk load")
-            return bulk_load(store, registry_dirs)
-
-    if updated > 0:
+    if commits is not None:
+        commits.update(heads)
+    if touched:
         build_type_index(store, registry_dirs)
-    logger.info(f"Update loaded {updated} changed files")
-    return updated
+    logger.info(f"Update loaded {len(touched)} changed namespaces")
+    return len(touched)

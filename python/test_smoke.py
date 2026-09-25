@@ -6,6 +6,7 @@ After the secid_server.py refactor (factory pattern), this file can now
 test the HTTP layer too via fastapi.testclient.TestClient.
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 from secid_server import ServerConfig, create_app
@@ -305,43 +306,23 @@ def test_load_type_info_returns_none_for_missing_registry():
 # ---------------------------------------------------------------------------
 
 
-def test_slug_from_pattern_simple():
-    """Canonical case-insensitive pattern produces a clean slug."""
-    from resolver import _slug_from_pattern
-    assert _slug_from_pattern("(?i)^cve$") == "cve"
-    assert _slug_from_pattern("(?i)^kev$") == "kev"
+def test_extract_name_slug():
+    """Source slug comes from the first pattern when it is a plain literal,
+    otherwise from the description (same rule as SecID-Service)."""
+    from resolver import extract_name_slug
+    assert extract_name_slug({"patterns": ["(?i)^cve$"], "description": "CVE"}) == "cve"
+    assert extract_name_slug({"patterns": ["(?i)^cna\\-tlr$"], "description": "x"}) == "cna-tlr"
+    assert extract_name_slug(
+        {"patterns": ["^[A-Za-z0-9]+$"], "description": "GitHub user name"}
+    ) == "github-user-name"
 
 
-def test_slug_from_pattern_with_dots_and_dashes():
-    """Patterns with dots and dashes (allowed in slugs) extract correctly."""
-    from resolver import _slug_from_pattern
-    assert _slug_from_pattern("(?i)^av-collision$") == "av-collision"
-    assert _slug_from_pattern("(?i)^ml.top10$") == "ml.top10"
-
-
-def test_slug_from_pattern_complex_returns_none():
-    """Patterns with character classes, alternation, or quantifiers don't
-    yield a clean slug — we return None and the caller falls back to omitting
-    the source segment from the SecID."""
-    from resolver import _slug_from_pattern
-    assert _slug_from_pattern("^CVE-\\d{4}-\\d{4,}$") is None
-    assert _slug_from_pattern("(a|b)") is None
-
-
-def test_cross_source_search_empty_term():
-    """Empty search_term should return empty list immediately."""
-    from resolver import _cross_source_search
+def test_type_scoped_search_empty_registry():
+    """No registry data at all: an unscoped query is not_found, not a crash."""
+    from resolver import resolve
     from storage import create_store
-    store = create_store("memory")
-    assert _cross_source_search(store, "advisory", "", None) == []
-
-
-def test_cross_source_search_no_registry():
-    """No registry data + no registry_dirs = no results."""
-    from resolver import _cross_source_search
-    from storage import create_store
-    store = create_store("memory")
-    assert _cross_source_search(store, "advisory", "CVE-2021-44228", None) == []
+    resp = resolve(create_store("memory"), "secid:advisory/CVE-2021-44228")
+    assert resp["status"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -524,3 +505,228 @@ def test_too_long_for_regex_helper():
     from resolver import _too_long_for_regex, MAX_REGEX_INPUT
     assert not _too_long_for_regex(None, "cve", "CVE-2021-44228")
     assert _too_long_for_regex("a" * (MAX_REGEX_INPUT + 1))
+
+
+# ---------------------------------------------------------------------------
+# Synthetic registry helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_ns(root, secid_type, rel, namespace, match_nodes, **extra):
+    import json
+    path = root / secid_type / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "type": secid_type, "namespace": namespace,
+        "official_name": extra.pop("official_name", namespace),
+        "urls": extra.pop("urls", []), "match_nodes": match_nodes, **extra,
+    }))
+    return path
+
+
+def _cve_node(url):
+    return [{
+        "patterns": ["(?i)^cve$"], "description": "CVE", "weight": 100, "data": {},
+        "children": [{
+            "patterns": ["^CVE-\\d{4}-\\d{4,}$"], "description": "CVE ID", "weight": 100,
+            "data": {"url": url},
+        }],
+    }]
+
+
+# ---------------------------------------------------------------------------
+# Overlay precedence (H5): a later registry dir overrides an earlier one,
+# regardless of load mode or which query arrives first
+# ---------------------------------------------------------------------------
+
+
+def _overlay_dirs(tmp_path):
+    public, private = tmp_path / "public", tmp_path / "private"
+    _write_ns(public, "advisory", "org/example.json", "example.org",
+              _cve_node("https://public.example.org/{id}"))
+    _write_ns(private, "advisory", "org/example.json", "example.org",
+              _cve_node("https://private.example.org/{id}"))
+    return [str(public), str(private)]
+
+
+def _urls(resp):
+    return [r["url"] for r in resp["results"] if "url" in r]
+
+
+def test_overlay_private_wins_in_every_query_order(tmp_path):
+    dirs = _overlay_dirs(tmp_path)
+    scoped = "secid:advisory/example.org/cve#CVE-2021-44228"
+    unscoped = "secid:advisory/CVE-2021-44228"
+    want = "https://private.example.org/CVE-2021-44228"
+    for mode in ("lazy", "bulk"):
+        for order in ((scoped, unscoped), (unscoped, scoped)):
+            client = TestClient(create_app(ServerConfig(registry_dirs=dirs, load_mode=mode)))
+            for q in order:
+                body = client.get("/api/v1/resolve", params={"secid": q}).json()
+                assert _urls(body) == [want], (mode, order, q, body)
+
+
+def test_overlay_bulk_load_and_load_single_agree(tmp_path):
+    import json
+    from registry_loader import bulk_load, load_single
+    from storage import create_store
+    dirs = _overlay_dirs(tmp_path)
+    bulk_store, lazy_store = create_store("memory"), create_store("memory")
+    bulk_load(bulk_store, dirs)
+    load_single(lazy_store, dirs, "advisory", "example.org")
+    key = "secid:advisory/example.org"
+    assert json.loads(bulk_store.get(key)) == json.loads(lazy_store.get(key))
+    child = json.loads(bulk_store.get(key))["match_nodes"][0]["children"][0]
+    assert child["data"]["url"] == "https://private.example.org/{id}"
+
+
+# ---------------------------------------------------------------------------
+# Hostile-but-harmless input never becomes a 500
+# ---------------------------------------------------------------------------
+
+
+def test_overlong_namespace_segment_is_not_found(tmp_path):
+    """A segment longer than the filesystem's name limit used to raise
+    OSError (File name too long) from the lazy loader -> HTTP 500."""
+    from registry_loader import load_single
+    from storage import create_store
+    dirs = _overlay_dirs(tmp_path)
+    assert load_single(create_store("memory"), dirs, "advisory", "a" * 300 + ".com") is None
+    client = TestClient(create_app(ServerConfig(registry_dirs=dirs)))
+    resp = client.get("/api/v1/resolve", params={"secid": "secid:advisory/" + "a" * 300 + ".com/x"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "not_found"
+
+
+def test_unicode_digits_do_not_match_ascii_patterns(tmp_path):
+    """Registry regexes are JavaScript regexes, where \\d is ASCII-only."""
+    dirs = _overlay_dirs(tmp_path)
+    client = TestClient(create_app(ServerConfig(registry_dirs=dirs)))
+    q = "secid:advisory/example.org/cve#CVE-\u0662\u0660\u0662\u0661-\u0664\u0664\u0662\u0662\u0668"
+    body = client.get("/api/v1/resolve", params={"secid": q}).json()
+    assert body["status"] == "related"
+    assert not _urls(body)
+
+
+# ---------------------------------------------------------------------------
+# URL substitution hardening
+# ---------------------------------------------------------------------------
+
+
+def test_relative_or_non_http_templates_rejected():
+    """A template with no literal http(s) authority has nothing to pin the
+    result to, so the substituted value would become the URL."""
+    from resolver import _substitute_url_template
+    assert _substitute_url_template("{id}", {}, "javascript:alert(1)") is None
+    assert _substitute_url_template("/advisories/{id}", {}, "x") is None
+    assert _substitute_url_template("ftp://example.com/{id}", {}, "x") is None
+    assert _substitute_url_template("https://example.com/static", {}, "x") == "https://example.com/static"
+
+
+def test_substituted_values_are_percent_encoded():
+    """Characters that would re-shape the URL are encoded; characters real
+    identifiers use in paths (':' '/' '.') are kept."""
+    from resolver import _substitute_url_template
+    assert _substitute_url_template("https://example.com/{id}", {}, "a?b#c d") == \
+        "https://example.com/a%3Fb%23c%20d"
+    assert _substitute_url_template("https://doi.org/{id}", {}, "10.1000/xyz:1") == \
+        "https://doi.org/10.1000/xyz:1"
+
+
+def test_id_lower_and_upper_variables():
+    from resolver import _substitute_url_template
+    assert _substitute_url_template("https://e.com/{id_lower}/{id_upper}", {}, "CVE-1-Ab") == \
+        "https://e.com/cve-1-ab/CVE-1-AB"
+
+
+# ---------------------------------------------------------------------------
+# Parser: qualifiers
+# ---------------------------------------------------------------------------
+
+
+def test_parse_qualifiers_source_and_item_level():
+    from resolver import parse_secid
+    p = parse_secid(
+        "secid:regulation/europa.eu/gdpr?lang=fr&x=1#art-32?lang=de",
+        lambda c: c == "europa.eu",
+    )
+    assert (p.type, p.namespace, p.name, p.subpath) == ("regulation", "europa.eu", "gdpr", "art-32")
+    assert p.qualifiers == {"lang": "de", "x": "1"}  # item-level wins
+
+
+# ---------------------------------------------------------------------------
+# /admin/reload diffs against the loaded commit and handles A/M/D/R
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+                        "PATH": __import__("os").environ.get("PATH", "")})
+
+
+def test_admin_reload_applies_modify_delete_rename(tmp_path):
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git not installed")
+    repo = tmp_path / "SecID"
+    reg = repo / "registry"
+    _write_ns(reg, "advisory", "org/alpha.json", "alpha.org", _cve_node("https://alpha.org/v1/{id}"))
+    _write_ns(reg, "advisory", "org/beta.json", "beta.org", _cve_node("https://beta.org/{id}"))
+    _write_ns(reg, "advisory", "org/gamma.json", "gamma.org", _cve_node("https://gamma.org/{id}"))
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    for mode in ("lazy", "bulk"):
+        client = TestClient(create_app(ServerConfig(
+            registry_dirs=[str(reg)], load_mode=mode, reload_token="t")))
+
+        def urls(q):
+            return _urls(client.get("/api/v1/resolve", params={"secid": q}).json())
+
+        assert urls("secid:advisory/alpha.org/cve#CVE-2021-0001") == ["https://alpha.org/v1/CVE-2021-0001"]
+        assert urls("secid:advisory/beta.org/cve#CVE-2021-0001")
+        # Commit a modify, a delete and a rename (the rename also changes the namespace).
+        _write_ns(reg, "advisory", "org/alpha.json", "alpha.org", _cve_node("https://alpha.org/v2/{id}"))
+        (reg / "advisory" / "org" / "beta.json").unlink()
+        _git(repo, "mv", "registry/advisory/org/gamma.json", "registry/advisory/org/delta.json")
+        _write_ns(reg, "advisory", "org/delta.json", "delta.org", _cve_node("https://gamma.org/{id}"))
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "change")
+
+        resp = client.post("/admin/reload", headers={"X-Reload-Token": "t"})
+        assert resp.status_code == 200
+        assert resp.json()["reloaded"] == 4  # alpha, beta, gamma, delta
+
+        assert urls("secid:advisory/alpha.org/cve#CVE-2021-0001") == ["https://alpha.org/v2/CVE-2021-0001"]
+        beta = client.get("/api/v1/resolve", params={"secid": "secid:advisory/beta.org/cve#CVE-2021-0001"}).json()
+        assert beta["status"] == "not_found"
+        assert client.get("/api/v1/resolve", params={"secid": "secid:advisory/gamma.org"}).json()["status"] == "not_found"
+        assert urls("secid:advisory/delta.org/cve#CVE-2021-0001") == ["https://gamma.org/CVE-2021-0001"]
+
+        # A second reload with nothing new changes nothing.
+        assert client.post("/admin/reload", headers={"X-Reload-Token": "t"}).json()["reloaded"] == 0
+
+        # Reset the repo for the next mode.
+        _git(repo, "reset", "-q", "--hard", "HEAD~1")
+
+
+def test_reload_without_git_does_full_reload_and_evicts(tmp_path):
+    """Not a git checkout: reload falls back to a full reload, which must
+    also evict namespaces whose files were deleted."""
+    from registry_loader import update_load
+    from storage import create_store
+    reg = tmp_path / "registry"
+    _write_ns(reg, "advisory", "org/alpha.json", "alpha.org", _cve_node("https://alpha.org/{id}"))
+    _write_ns(reg, "advisory", "org/beta.json", "beta.org", _cve_node("https://beta.org/{id}"))
+    store = create_store("memory")
+    commits = {}
+    update_load(store, [str(reg)], commits=commits)
+    assert store.get("secid:advisory/beta.org")
+    (reg / "advisory" / "org" / "beta.json").unlink()
+    update_load(store, [str(reg)], commits=commits)
+    assert store.get("secid:advisory/beta.org") is None
+    assert store.get("secid:advisory/alpha.org")

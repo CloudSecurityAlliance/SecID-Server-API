@@ -100,55 +100,10 @@ def _urls(body: dict) -> list[str]:
 #
 # Each entry is a case id that currently fails, with the reason. They are
 # strict xfails: when a fix lands the case XPASSes, which fails the run, so
-# the entry has to be deleted in the same change. Delete this block once it
-# is empty.
+# the entry has to be deleted in the same change.
 # ---------------------------------------------------------------------------
 
-_UNMATCHED = "unmatched subpath returns the parent as found instead of related"
-_OPEN = "open_pattern / known_values ignored, so open patterns fabricate matches"
-_DEPTH = "resolution only walks one level: version_required, lookup_table and versioned grandchildren are not handled"
-_VARS = "URL variables beyond {id} / simple extract ({id_lower}, range_table, lang) not implemented"
-_QUAL = "?qualifiers are not parsed"
-_CORRECTED = "'corrected' status never returned"
-_ASCII = "registry regexes compiled without re.ASCII, so Unicode digits match \\d"
-_DISCOVERY = "discovery responses (root, bare type, wildcard, namespace listing) differ from live"
-_NOTFOUND = "not_found paths differ from live (unknown type is 'error', no guidance message)"
-
-KNOWN_FAILURES = {
-    # client fixtures
-    "corrected_misplaced_subpath": _CORRECTED,
-    "error_malformed": _NOTFOUND,
-    "not_found_unknown_type": _NOTFOUND,
-    # targeted
-    "unmatched-subpath-disa": _UNMATCHED,
-    "unmatched-subpath-cve": _UNMATCHED,
-    "unknown-version": _DEPTH,
-    "open-pattern-unscoped": _OPEN,
-    "no-fabricated-torvalds": _OPEN,
-    "no-fabricated-ismap": _OPEN,
-    "namespace-identity": "namespace identity search (identity.ts) not implemented",
-    "versioned-lookup-table": _DEPTH,
-    "version-required-without-version": _DEPTH,
-    "version-kept-in-secid": "the @version is dropped from result secids",
-    "lookup-table-versioned": _DEPTH,
-    "lookup-table-unversioned": _DEPTH,
-    "id-lower": _VARS,
-    "range-table": _VARS,
-    "lang-default": _VARS,
-    "lang-qualifier": _QUAL,
-    "lang-unavailable": _QUAL,
-    "source-qualifier-stripped": _QUAL,
-    "content-type-qualifier": _QUAL,
-    "corrected-misplaced-subpath": _CORRECTED,
-    "unicode-digits-unscoped": _ASCII,
-    "unicode-digits-scoped": _ASCII,
-    "unknown-type": _NOTFOUND,
-    "namespace-miss": _NOTFOUND,
-    "overlong-namespace-segment": "a 256-char namespace segment raises OSError (File name too long) -> HTTP 500",
-    "root": _DISCOVERY,
-    "type-wildcard": _DISCOVERY,
-    "namespace-listing": _DISCOVERY,
-}
+KNOWN_FAILURES: dict[str, str] = {}
 
 
 def _known_failure(case_id: str) -> list:
@@ -328,6 +283,18 @@ TARGETED_CASES = [
          "not_found", message="not found"),
     Case("overlong-namespace-segment", "secid:advisory/" + "a" * 256 + ".com/x", "not_found"),
 
+    # --- cross-source ordering and bare identifiers
+    Case("tie-order-matches-live", "secid:control/IAM-12", "found", result_secids=[
+        "secid:control/cloudsecurityalliance.org/aicm-caiq#IAM-12",
+        "secid:control/cloudsecurityalliance.org/aicm#IAM-12",
+        "secid:control/cloudsecurityalliance.org/ccm-caiq#IAM-12",
+        "secid:control/cloudsecurityalliance.org/ccm#IAM-12",
+    ]),
+    Case("bare-source-name", "cwe", "found", result_secids=[
+        "secid:entity/mitre.org/cwe", "secid:weakness/mitre.org/cwe",
+    ]),
+    Case("prefix-optional", "advisory/mitre.org/cve#CVE-2021-44228", "found", url=CVE_URL),
+
     # --- discovery
     Case("root", "secid:", "found", result_secids=[f"secid:{t}" for t in ALL_TYPES]),
     Case("bare-type", "secid:advisory", "found", first_secid="secid:advisory"),
@@ -360,3 +327,44 @@ def test_targeted(client: TestClient, case: Case) -> None:
         assert [r.get("secid") for r in results] == case.result_secids, body
     if case.message:
         assert case.message in (body.get("message") or ""), body
+
+
+# ---------------------------------------------------------------------------
+# 4. The registry's own structured examples
+#
+# Child-level data.examples entries of the form {"input", "url"} are the
+# registry's test fixtures (REGISTRY-JSON-FORMAT.md). Every one must resolve
+# to its URL through the namespace-qualified form. Versioned sources are
+# skipped: their examples do not say which version they belong to.
+# ---------------------------------------------------------------------------
+
+
+def _registry_examples() -> list[tuple[str, str]]:
+    from resolver import extract_name_slug
+
+    cases = []
+    for path in sorted(REGISTRY_DIR.glob("*/**/*.json")):
+        if any(part.startswith("_") for part in path.relative_to(REGISTRY_DIR).parts):
+            continue
+        ns = json.loads(path.read_text())
+        for source in ns.get("match_nodes", []):
+            if (source.get("data") or {}).get("version_required"):
+                continue
+            slug = extract_name_slug(source)
+            for child in source.get("children", []):
+                for ex in (child.get("data") or {}).get("examples") or []:
+                    if isinstance(ex, dict) and ex.get("input") and ex.get("url"):
+                        secid = f"secid:{ns['type']}/{ns['namespace']}/{slug}#{ex['input']}"
+                        cases.append((secid, ex["url"]))
+    return cases
+
+
+def test_registry_examples_resolve(client: TestClient) -> None:
+    cases = _registry_examples()
+    assert cases, "no structured examples found - has the registry format changed?"
+    failures = []
+    for secid, url in cases:
+        _, body = _resolve(client, secid)
+        if url not in _urls(body):
+            failures.append(f"{secid}: expected {url}, got {body.get('status')} {_urls(body)[:3]}")
+    assert not failures, f"{len(failures)}/{len(cases)} examples failed:\n" + "\n".join(failures[:25])
