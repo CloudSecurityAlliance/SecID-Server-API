@@ -5,7 +5,7 @@
 - `typescript/` and `go/` are placeholders for the planned production-throughput implementations.
 - `tests/` documents the planned shared conformance suite (fixtures live in `SecID-Client-SDK`).
 - `docker/` documents planned containerization.
-- `.github/workflows/test.yml` runs the Python smoke suite on every PR.
+- `.github/workflows/test.yml` runs the Python test suite (smoke + real-registry) on every PR.
 - Repository root docs describe self-hosting, storage modes, and compatibility with the hosted service.
 
 ## Build, Test, and Development Commands
@@ -25,7 +25,8 @@ Run from repository root unless noted.
 ## Testing Guidelines
 - `python/test_smoke.py` covers imports, the factory, basic HTTP endpoints, and type-list invariants. Run with `pytest test_smoke.py -v` from `python/`.
 - For new HTTP endpoints, add a test using `fastapi.testclient.TestClient` against `create_app(ServerConfig(...))`. See the existing endpoint tests for the pattern.
-- For resolver logic changes, compare outputs against the hosted service for representative SecIDs.
+- `python/test_real_registry.py` runs the resolver against the real registry (`SECID_REGISTRY_DIR`, default `../../SecID/registry`) plus the shared fixtures in `SecID-Client-SDK` (`SECID_CLIENT_SDK_DIR`, default `../../SecID-Client-SDK`), in both lazy and bulk load modes. It skips with a message if either checkout is missing. Expectations come from the live resolver.
+- For resolver logic changes, compare outputs against the hosted service for representative SecIDs, and add the case to `TARGETED_CASES` in `test_real_registry.py`.
 - Conformance against the canonical SecID-Service is the broader goal — the shared fixture suite lives in `SecID-Client-SDK/tests/fixtures.json` and is being grown into a multi-implementation conformance gate.
 
 ## Commit & Pull Request Guidelines
