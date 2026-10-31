@@ -110,10 +110,10 @@ Resolution results may include optional format metadata fields: `parsability`, `
 
 Point any MCP client at your self-hosted server. It serves the same three tools as SecID-Service, `resolve`, `lookup`, and `describe`, with the same names. The `submit_feedback` tool is not provided.
 
-MCP support requires the `mcp` Python package, version 1.8 or later (both the 1.x and 2.x SDKs work):
+MCP support requires the `mcp` Python package, version 1.23 or later (both the 1.x and 2.x SDKs work; `>=1.23.0` is required for built-in DNS-rebinding protection):
 
 ```bash
-pip install mcp
+pip install "mcp>=1.23.0,<3.0.0"
 ```
 
 Without it, the server starts normally and serves the REST API; the `/mcp` endpoint is logged as "disabled" at startup. This keeps the MCP dependency optional for users who only need the REST API.

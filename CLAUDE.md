@@ -53,12 +53,13 @@ curl "http://localhost:8000/api/v1/resolve?secid=secid:advisory/mitre.org/cve%23
 curl http://localhost:8000/health
 
 # Reload after `git pull` in the registry (requires a reload token)
-SECID_RELOAD_TOKEN=... python secid_server.py --registry /path/to/SecID/registry
+export SECID_RELOAD_TOKEN=...
+python secid_server.py --registry /path/to/SecID/registry
 curl -X POST http://localhost:8000/admin/reload -H "X-Reload-Token: $SECID_RELOAD_TOKEN"
 
 # Tests (real-registry tests need ../../SecID and ../../SecID-Client-SDK, or
 # SECID_REGISTRY_DIR / SECID_CLIENT_SDK_DIR)
-pip install pytest httpx mcp
+pip install pytest httpx "mcp>=1.23.0,<3.0.0"
 pytest -v -rs
 ```
 
