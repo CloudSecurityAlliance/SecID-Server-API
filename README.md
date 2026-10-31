@@ -168,10 +168,12 @@ To check a running server, including the live service, use the conformance harne
 python ../SecID-Client-SDK/tests/conformance-harness/python/run.py --target http://localhost:8000
 ```
 
-## All SecID Repos
+## Related Documentation & SecID Repos
 
-| Repo | What it is |
+| Document / Repo | What it is |
 |------|-----------|
+| **[`BUSINESS-CASE.md`](BUSINESS-CASE.md)** | Business case, stakeholder value, AI enablement, and risk assessment |
+| **[`GOALS.md`](GOALS.md)** | Vision, objectives, and measurable success metrics |
 | **[SecID](https://github.com/CloudSecurityAlliance/SecID)** | Specification + registry data |
 | **[SecID-Service](https://github.com/CloudSecurityAlliance/SecID-Service)** | Cloudflare-hosted production service |
 | **[SecID-Server-API](https://github.com/CloudSecurityAlliance/SecID-Server-API)** (this repo) | Self-hosted resolver (Python; TypeScript, Go and Docker planned) |
