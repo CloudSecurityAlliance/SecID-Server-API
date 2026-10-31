@@ -29,6 +29,8 @@ SecID-Server-API/
 ├── docker/                  # Dockerfile and compose (planned, README only)
 ├── tests/                   # Pointer to the shared conformance suite in SecID-Client-SDK
 ├── .github/workflows/       # CI: runs pytest on the Python matrix
+├── BUSINESS-CASE.md         # Component business case, AI enablement, and risk assessment
+├── GOALS.md                 # Component goals and measurable success metrics
 ├── README.md
 └── AGENTS.md
 ```
