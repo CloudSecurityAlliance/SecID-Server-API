@@ -698,8 +698,8 @@ def test_admin_reload_applies_modify_delete_rename(tmp_path):
 
         assert urls("secid:advisory/alpha.org/cve#CVE-2021-0001") == ["https://alpha.org/v1/CVE-2021-0001"]
         assert urls("secid:advisory/beta.org/cve#CVE-2021-0001")
-        # Commit a modify, a delete and a rename (the rename also changes the namespace).
-        _write_ns(reg, "advisory", "org/alpha.json", "alpha.org", _cve_node("https://alpha.org/v2/{id}"))
+        # Commit an in-place namespace change (M), a delete (D) and a rename (R).
+        _write_ns(reg, "advisory", "org/alpha.json", "alpha-new.org", _cve_node("https://alpha.org/v2/{id}"))
         (reg / "advisory" / "org" / "beta.json").unlink()
         _git(repo, "mv", "registry/advisory/org/gamma.json", "registry/advisory/org/delta.json")
         _write_ns(reg, "advisory", "org/delta.json", "delta.org", _cve_node("https://gamma.org/{id}"))
@@ -708,9 +708,10 @@ def test_admin_reload_applies_modify_delete_rename(tmp_path):
 
         resp = client.post("/admin/reload", headers={"X-Reload-Token": "t"})
         assert resp.status_code == 200
-        assert resp.json()["reloaded"] == 4  # alpha, beta, gamma, delta
+        assert resp.json()["reloaded"] == 5  # alpha.org (evicted), alpha-new.org, beta.org, gamma.org, delta.org
 
-        assert urls("secid:advisory/alpha.org/cve#CVE-2021-0001") == ["https://alpha.org/v2/CVE-2021-0001"]
+        assert client.get("/api/v1/resolve", params={"secid": "secid:advisory/alpha.org/cve#CVE-2021-0001"}).json()["status"] == "not_found"
+        assert urls("secid:advisory/alpha-new.org/cve#CVE-2021-0001") == ["https://alpha.org/v2/CVE-2021-0001"]
         beta = client.get("/api/v1/resolve", params={"secid": "secid:advisory/beta.org/cve#CVE-2021-0001"}).json()
         assert beta["status"] == "not_found"
         assert client.get("/api/v1/resolve", params={"secid": "secid:advisory/gamma.org"}).json()["status"] == "not_found"

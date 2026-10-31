@@ -34,7 +34,7 @@ import logging
 import re
 import threading
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from registry_loader import SECID_TYPES, load_namespaces, load_type_info
@@ -568,6 +568,82 @@ def namespace_aliases(ns_key: str, ns: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _pattern_literal(pat: str) -> Optional[str]:
+    """The literal string an anchored pattern matches, or None when it is not a
+    plain literal (ADR-015: a version node's patterns[0] is the canonical form).
+    `(?i)^1\\.1\\.1$` -> "1.1.1"."""
+    body = re.sub(r"^\(\?i\)", "", pat)
+    body = re.sub(r"^\^", "", body)
+    body = re.sub(r"\$$", "", body)
+    out = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\":
+            if i + 1 >= len(body) or body[i + 1].isalnum():
+                return None  # \d, \w, ...
+            out.append(body[i + 1])
+            i += 2
+        elif ch in ".*+?()[]{}|^$":
+            return None
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out) or None
+
+
+def _match_version_alias(node: dict, version: str) -> Optional[tuple[str, str]]:
+    """If `version` is an alias of another version of this source, return
+    `(canonical, on_match)`. None for a canonical or unknown version."""
+    d = _node_data(node)
+    for entry in d.get("versions_available") or []:
+        if not isinstance(entry, dict):
+            continue
+        canonical = entry.get("version")
+        if not isinstance(canonical, str) or canonical == version:
+            continue
+        for alias in entry.get("aliases") or []:
+            if isinstance(alias, dict) and alias.get("label") == version:
+                on_match = "redirect" if alias.get("on_match") == "redirect" else "resolve"
+                return (canonical, on_match)
+    if d.get("version_required") and _children(node):
+        child = next((c for c in _children(node)
+                      if matches_any_pattern(c.get("patterns", []), version)), None)
+        if child:
+            patterns = child.get("patterns") or []
+            canonical = _pattern_literal(patterns[0]) if patterns else None
+            if canonical and canonical != version:
+                return (canonical, "resolve")
+    return None
+
+
+def _describe_versions(node: dict) -> str:
+    entries = [e for e in (_node_data(node).get("versions_available") or [])
+               if isinstance(e, dict) and e.get("version")]
+    if not entries:
+        return "none listed"
+    parts = []
+    for e in entries:
+        facts = []
+        status = ", ".join(x for x in (e.get("status"), e.get("release_date")) if x)
+        if status:
+            facts.append(status)
+        labels = [a["label"] for a in (e.get("aliases") or [])
+                  if isinstance(a, dict) and a.get("label")]
+        if labels:
+            facts.append(f"aliases {', '.join(labels)}")
+        parts.append(f"{e['version']} ({'; '.join(facts)})" if facts else str(e["version"]))
+    return ", ".join(parts)
+
+
+def _as_corrected(r: dict) -> dict:
+    if r.get("status") not in ("found", "corrected"):
+        return r
+    out = {k: v for k, v in r.items() if k != "message"}
+    out["status"] = "corrected"
+    return out
+
+
 class _Resolution:
     """One query against `type_registry` (namespace -> data, for parsed.type).
     `aliases(ns)` returns cached namespace aliases."""
@@ -641,9 +717,95 @@ class _Resolution:
                 return type_results
             return _response(self.q, "related", self.list_sources(ns)["results"],
                              f'Name "{p.name}" not found in {p.namespace}. Available sources listed.')
+        if p.version:
+            alias = _match_version_alias(node, p.version)
+            if alias:
+                canonical, on_match = alias
+                canonical_parsed = replace(p, version=canonical)
+                if on_match == "redirect":
+                    return self._version_redirect(p.version, canonical_parsed, node)
+                self.p = p = canonical_parsed
+            mismatch = self._resolve_version_mismatch(node, ns)
+            if mismatch is not None:
+                return mismatch
         if not p.subpath:
             return self.describe_source(node)
         return self.resolve_subpath(node)
+
+    def _version_redirect(self, asked: str, canonical: ParsedSecID, node: dict) -> dict:
+        base = f"secid:{canonical.type}/{canonical.namespace}/{extract_name_slug(node)}@{canonical.version}"
+        target = f"{base}#{canonical.subpath}" if canonical.subpath else base
+        return _response(
+            self.q, "corrected", [],
+            f'Version "{asked}" is an alias of {canonical.version}. Query {target} instead.',
+        )
+
+    def _version_not_found(self, node: dict) -> dict:
+        p = self.p
+        slug = extract_name_slug(node)
+        return _response(
+            self.q, "not_found", [],
+            f'Version "{p.version}" is not a known version of {slug}. Known versions: {_describe_versions(node)}. '
+            f'To list versions, describe the source without a version (secid:{p.type}/{p.namespace}/{slug}). '
+            f'Report a genuinely missing release via the submit_feedback tool (include a source URL) or {ISSUES_URL}',
+        )
+
+    def _version_required_miss(self, node: dict) -> dict:
+        p = self.p
+        d = _node_data(node)
+        slug = extract_name_slug(node)
+        return _response(
+            self.q, "related",
+            [{
+                "secid": f"secid:{p.type}/{p.namespace}/{slug}",
+                "data": {
+                    "official_name": d.get("official_name") or node.get("description"),
+                    "version_required": True,
+                    "versions_available": d.get("versions_available") or [],
+                    "version_disambiguation": d.get("version_disambiguation"),
+                },
+            }],
+            f'Version "{p.version}" is not a known version of {slug}. Known versions: {_describe_versions(node)}.',
+        )
+
+    def _resolve_version_mismatch(self, node: dict, ns: dict) -> Optional[dict]:
+        p = self.p
+        version = p.version
+        if not version:
+            return None
+        d = _node_data(node)
+        listed = [v["version"] for v in (d.get("versions_available") or [])
+                  if isinstance(v, dict) and isinstance(v.get("version"), str)]
+        if d.get("version_required"):
+            children = _children(node)
+            if not children:
+                return None
+            if any(matches_any_pattern(c.get("patterns", []), version) for c in children):
+                return None
+            return self._version_not_found(node) if p.subpath else self._version_required_miss(node)
+
+        if version in listed:
+            return None
+
+        def with_version(v: Optional[str]) -> dict:
+            return _Resolution(replace(p, version=v), self.reg, self.aliases).resolve_with_name(ns)
+
+        case_match = next((v for v in listed if v.lower() == version.lower()), None)
+        if case_match is not None:
+            return _as_corrected(with_version(case_match))
+
+        if listed and p.subpath:
+            return self._version_not_found(node)
+
+        r = with_version(None)
+        if listed:
+            if r.get("status") in ("found", "corrected"):
+                r["status"] = "related"
+            note = (f'Version "{version}" not found for {extract_name_slug(node)}. '
+                    f'Known versions: {_describe_versions(node)}. Showing the source without a version.')
+            r["message"] = f"{note} {r['message']}" if r.get("message") else note
+            return r
+        return _as_corrected(r)
 
     def _source_secid(self, node: dict, with_version: bool = True) -> str:
         base = f"secid:{self.p.type}/{self.p.namespace}/{extract_name_slug(node)}"
@@ -699,10 +861,7 @@ class _Resolution:
         version_child = next((c for c in _children(node)
                               if matches_any_pattern(c.get("patterns", []), p.version)), None)
         if version_child is None:
-            versions = [v.get("version") for v in (d.get("versions_available") or [])
-                        if isinstance(v, dict) and v.get("version")]
-            return _response(self.q, "not_found", [],
-                             f'Version "{p.version}" not found. Available: {", ".join(versions) or "none listed"}')
+            return self._version_not_found(node) if p.subpath else self._version_required_miss(node)
         vd = _node_data(version_child)
         if not p.subpath:
             data = {
@@ -785,7 +944,8 @@ class _Resolution:
         if url:
             return _resolution_result(secid, child.get("weight"), url, _node_data(child))
         return {"secid": secid, "data": {"description": child.get("description"),
-                                         "weight": child.get("weight")}}
+                                         "weight": child.get("weight"),
+                                         "note": _node_data(child).get("note")}}
 
     def namespace_scoped_search(self, ns: dict) -> list:
         """The name matched no source: treat it as an item identifier within
@@ -926,6 +1086,26 @@ def _namespace_listing_entry(ns_key: str, data: dict, include_key: bool = True) 
 # Registry index + query orchestration (port of kv-resolve.ts)
 # ---------------------------------------------------------------------------
 
+_STATUS_RANK = {
+    "error": 0,
+    "not_found": 1,
+    "related": 2,
+    "corrected": 3,
+    "found": 4,
+}
+
+
+def _bare_search_not_found(query: str, term: str) -> dict:
+    msg = (
+        f'No matches for "{term}". A bare term is searched across every type as an identifier '
+        f'(e.g. CVE-2021-44228), a source name (e.g. cwe) and a namespace name (e.g. fedramp). '
+        f'Try a scoped query such as secid:advisory/{term}, or "secid:" to list the types.'
+    )
+    slash = term.find("/")
+    if slash > 0:
+        msg += f' If "{term[:slash]}" was meant as a type, valid types are: {", ".join(SECID_TYPES)}.'
+    return _response(query, "not_found", [], msg)
+
 
 class RegistryIndex:
     """Per-type namespace data, built once per type and cached.
@@ -982,7 +1162,7 @@ class RegistryIndex:
                     if isinstance(ns, dict):
                         data[key[len(prefix):]] = ns
             self._child_patterns[secid_type] = [
-                (ns_key, child.get("patterns", []))
+                (ns_key, child.get("patterns", []), is_node_open(child))
                 for ns_key, ns in data.items()
                 for node in _match_nodes(ns)
                 for child in _children(node)
@@ -1005,15 +1185,20 @@ class RegistryIndex:
             self._aliases[key] = cached
         return cached
 
-    def child_index_matches(self, secid_type: str, identifier: str) -> list[str]:
-        """Namespaces with a child pattern matching identifier (raw regex, as
-        the Service's child_index prefilter does - open-pattern handling
-        happens later in node_matches)."""
+    def child_index_matches(self, secid_type: str, identifier: str,
+                            *, tight_only: Optional[bool] = None) -> list[str]:
+        """Namespaces with a child pattern matching identifier. When tight_only
+        is True, only non-open child patterns are checked; when False, only
+        open ones; when None, all."""
         self.namespaces(secid_type)
         if len(identifier) > MAX_REGEX_INPUT:
             return []
         matched: dict[str, None] = {}
-        for ns_key, patterns in self._child_patterns.get(secid_type, []):
+        for ns_key, patterns, is_open in self._child_patterns.get(secid_type, []):
+            if tight_only is True and is_open:
+                continue
+            if tight_only is False and not is_open:
+                continue
             if ns_key not in matched and matches_any_pattern(patterns, identifier):
                 matched[ns_key] = None
         return list(matched)
@@ -1026,6 +1211,23 @@ class RegistryIndex:
                 query[:MAX_SECID_QUERY_CHARS], "error", [],
                 f"Query too long: SecID queries are limited to {MAX_SECID_QUERY_CHARS} characters.",
             )
+        as_is = self._resolve_once(query)
+        if as_is["status"] in ("found", "corrected"):
+            return as_is
+        if not re.search(r"%[0-9A-Fa-f]{2}", query):
+            return as_is
+        try:
+            decoded = urllib.parse.unquote(query, errors="strict")
+        except UnicodeDecodeError:
+            return as_is
+        if decoded == query or len(decoded) > MAX_SECID_QUERY_CHARS:
+            return as_is
+        alt = self._resolve_once(decoded)
+        if _STATUS_RANK.get(alt["status"], 0) > _STATUS_RANK.get(as_is["status"], 0):
+            return {**alt, "secid_query": query}
+        return as_is
+
+    def _resolve_once(self, query: str) -> dict:
         trimmed = query.strip()
         if not trimmed:
             return _response(query, "error", [], "Empty query. Provide a SecID string.")
@@ -1039,6 +1241,7 @@ class RegistryIndex:
                 bare = self._search_bare_identifier(query, trimmed)
                 if bare:
                     return bare
+                return _bare_search_not_found(query, trimmed)
             return _Resolution(parse_secid(query, lambda _c: False), {}, self.aliases).run()
 
         ns_map = self.namespaces(secid_type)
@@ -1051,6 +1254,12 @@ class RegistryIndex:
 
         subset = {ns: ns_map[ns] for ns in self._determine_namespaces(parsed, secid_type, ns_map)
                   if ns in ns_map}
+        if not parsed.namespace and parsed.name and not subset:
+            return _response(
+                query, "not_found", [],
+                f'No results found for "{parsed.name}" in type "{secid_type}". If this source should be '
+                f"covered, request it at {ISSUES_URL}",
+            )
         result = _Resolution(parsed, subset, self.aliases).run()
 
         if result["status"] == "not_found" and parsed.namespace and parsed.namespace not in ns_map:
@@ -1061,10 +1270,10 @@ class RegistryIndex:
         return result
 
     def _determine_namespaces(self, parsed: ParsedSecID, secid_type: str, ns_map: dict) -> list[str]:
-        """Which namespaces the resolver sees. Mirrors the Service, whose
-        resolver only ever sees the namespaces it fetched from KV - so an
-        unscoped search considers namespaces whose child patterns match the
-        identifier, or every namespace when none do."""
+        """Which namespaces the resolver sees. Mirrors SecID-Service's
+        determineNamespaces + crossSourceCandidates: tight child pattern
+        matches win; otherwise open child matches are combined with source-name
+        and namespace-identity candidates."""
         if parsed.namespace:
             namespaces = [parsed.namespace]
             if parsed.name and parsed.subpath:
@@ -1073,8 +1282,26 @@ class RegistryIndex:
                         namespaces.append(ns)
             return namespaces
         if parsed.name:
-            matches = self.child_index_matches(secid_type, parsed.name)
-            return matches or list(ns_map)
+            tight = self.child_index_matches(secid_type, parsed.name, tight_only=True)
+            if tight:
+                return tight
+            matched: dict[str, None] = {
+                ns: None for ns in self.child_index_matches(secid_type, parsed.name, tight_only=False)
+            }
+            if len(parsed.name) <= MAX_REGEX_INPUT:
+                for ns_key, ns in ns_map.items():
+                    if ns_key in matched:
+                        continue
+                    for node in _match_nodes(ns):
+                        if not is_node_open(node) and matches_any_pattern(node.get("patterns", []), parsed.name):
+                            matched[ns_key] = None
+                            break
+            needle = parsed.name.strip().lower()
+            if needle:
+                for ns_key, ns in ns_map.items():
+                    if ns_key not in matched and needle in self.aliases(ns_key, ns):
+                        matched[ns_key] = None
+            return list(matched)
         return list(ns_map)
 
     def _type_description(self, secid_type: str) -> str:

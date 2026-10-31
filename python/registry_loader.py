@@ -431,7 +431,10 @@ def _changed_namespaces(registry_dir: str, base: str, head: str) -> Optional[set
             note(head, parts[2])
         elif status == "D":
             note(base, parts[1])
-        elif status in ("A", "M", "T"):
+        elif status == "A":
+            note(head, parts[1])
+        elif status in ("M", "T"):
+            note(base, parts[1])
             note(head, parts[1])
     return touched
 

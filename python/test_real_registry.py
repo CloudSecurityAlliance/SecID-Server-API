@@ -188,12 +188,23 @@ def _conformance_cases() -> list:
     return [pytest.param(t, id=t["name"]) for t in tests]
 
 
+CONFORMANCE_LIVE_OVERRIDES = {
+    # After SecID-Service#33 (c8b3a93), a source without version_required or
+    # versions_available (first.org/cvss models 4.0 as a subpath child #4.0,
+    # not @version) drops @4.0 and returns status="corrected".
+    "resolve-cvss-40": {"response_status": "corrected"},
+}
+
+
 @pytest.mark.parametrize("fixture", _conformance_cases())
 def test_conformance_fixture(client: TestClient, fixture: dict) -> None:
     check_behavioral = _load_check_behavioral()
     inp = fixture["input"]
+    expected = json.loads(json.dumps(fixture["expected"]))
+    if fixture["name"] in CONFORMANCE_LIVE_OVERRIDES:
+        expected.setdefault("behavioral", {}).update(CONFORMANCE_LIVE_OVERRIDES[fixture["name"]])
     resp = client.request(inp.get("method", "GET"), inp["endpoint"], params=inp.get("query") or {})
-    failures = check_behavioral(resp.json(), resp.status_code, fixture["expected"])
+    failures = check_behavioral(resp.json(), resp.status_code, expected)
     assert not failures, failures
 
 
@@ -230,7 +241,7 @@ TARGETED_CASES = [
     Case("unmatched-subpath-cve", "secid:advisory/mitre.org/cve#NOTACVE",
          "related", message="did not match", no_urls=True),
     Case("unknown-version", "secid:weakness/owasp.org/top10@2025#LLM01",
-         "not_found", message='Version "2025" not found'),
+         "not_found", message='Version "2025" is not a known version of top10'),
 
     # --- open_pattern / known_values: open spaces never answer an unscoped search
     Case("open-pattern-unscoped", "secid:advisory/HADOOP-1234",
@@ -239,6 +250,12 @@ TARGETED_CASES = [
          "found", url="https://issues.apache.org/jira/browse/HADOOP-1234"),
     Case("no-fabricated-torvalds", "secid:reference/torvalds", "not_found"),
     Case("no-fabricated-ismap", "secid:reference/ismap", "not_found"),
+    Case("open-child-does-not-suppress-source-name", "secid:reference/arxiv",
+         "found", first_secid="secid:reference/arxiv.org"),
+    Case("open-child-does-not-suppress-namespace-alias", "secid:reference/oecd",
+         "found", result_secids=["secid:reference/oecd.ai", "secid:reference/oecd.org"]),
+    Case("percent-encoded-hash-fallback", "secid:advisory/mitre.org/cve%23CVE-2021-44228",
+         "found", url=CVE_URL, first_secid="secid:advisory/mitre.org/cve#CVE-2021-44228"),
     Case("namespace-identity", "secid:control/ismap",
          "found", url="https://www.ismap.go.jp/", first_secid="secid:control/ismap.go.jp"),
 
@@ -248,10 +265,18 @@ TARGETED_CASES = [
          first_secid="secid:weakness/owasp.org/top10@2021#A01"),
     Case("version-required-without-version", "secid:weakness/owasp.org/top10#A01",
          "related", message="requires a version"),
+    Case("version-required-unknown-version-no-subpath", "secid:weakness/owasp.org/top10@bogus",
+         "related", message='Version "bogus" is not a known version of top10'),
+    Case("unversioned-source-with-version", "secid:advisory/mitre.org/cve@1.0#CVE-2021-44228",
+         "corrected", url=CVE_URL, first_secid="secid:advisory/mitre.org/cve#CVE-2021-44228"),
+    Case("version-alias-canonicalized", "secid:control/cloudsecurityalliance.org/aicm@1.1#LOG-15",
+         "found", first_secid="secid:control/cloudsecurityalliance.org/aicm@1.1.1#LOG-15"),
     Case("version-kept-in-secid", "secid:control/cloudsecurityalliance.org/ccm@4.0#IAM-12",
          "found", first_secid="secid:control/cloudsecurityalliance.org/ccm@4.0#IAM-12"),
-    Case("describe-version", "secid:methodology/first.org/cvss@4.0",
-         "found", first_secid="secid:methodology/first.org/cvss@4.0"),
+    Case("describe-version", "secid:control/nist.gov/csf@2.0",
+         "found", first_secid="secid:control/nist.gov/csf@2.0"),
+    Case("unversioned-source-version-dropped", "secid:methodology/first.org/cvss@4.0",
+         "corrected", first_secid="secid:methodology/first.org/cvss"),
 
     # --- lookup_table (own-key semantics)
     Case("lookup-table-versioned", "secid:weakness/owasp.org/llm-top10@2.0#LLM01",
