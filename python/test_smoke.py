@@ -654,6 +654,15 @@ def test_parse_qualifiers_source_and_item_level():
     assert p.qualifiers == {"lang": "de", "x": "1"}  # item-level wins
 
 
+def test_locale_key_orders_hyphen_before_hash():
+    """ICU root collation orders '-' before '#' (opposite of ASCII code points),
+    so 'aicm-caiq#IAM-12' sorts before 'aicm#IAM-12' on a weight tie."""
+    from resolver import _locale_key
+    assert _locale_key("secid:control/example.org/aicm-caiq#IAM-12") < (
+        _locale_key("secid:control/example.org/aicm#IAM-12")
+    )
+
+
 # ---------------------------------------------------------------------------
 # /admin/reload diffs against the loaded commit and handles A/M/D/R
 # ---------------------------------------------------------------------------

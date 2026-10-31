@@ -115,18 +115,26 @@ def _known_failure(case_id: str) -> list:
 # 1. Shared client fixtures
 # ---------------------------------------------------------------------------
 
-# fixture name -> (live status, reason the mock body is not what live returns)
+# fixture name -> (live status, live best_url, reason the mock body is not what live returns)
 LIVE_OVERRIDES = {
     "error_malformed": (
         "not_found",
+        None,
         "Input without a 'secid:' prefix is a bare-identifier search on the "
         "live resolver; nothing matches, so it answers not_found (Invalid type).",
     ),
     "related_version_required": (
         "found",
+        None,
         "A version_required source queried with no version and no subpath is "
         "described (found); 'related' + disambiguation applies once a subpath "
         "is given without @version.",
+    ),
+    "encoding_ampersand": (
+        "found",
+        None,
+        "After SecID#207 migrated CCM to version_required version nodes, "
+        "ccm@4.0#A&A-01 resolves to a data-only control description (no per-control URL).",
     ),
 }
 
@@ -137,8 +145,13 @@ def _client_fixture_cases() -> list:
     tests = json.loads(CLIENT_FIXTURES.read_text())["tests"]
     cases = []
     for t in tests:
-        if t.get("category") == "client_error" or t["input"].get("method") != "resolve":
-            continue  # transport-level client behaviour; nothing to check server-side
+        secid = t["input"].get("secid", "")
+        if (
+            t.get("category") == "client_error"
+            or t["input"].get("method") != "resolve"
+            or "/example.org/" in secid
+        ):
+            continue  # transport-level or synthetic-namespace (RFC 2606) client mock test
         cases.append(pytest.param(t, id=t["name"], marks=_known_failure(t["name"])))
     return cases
 
@@ -146,12 +159,14 @@ def _client_fixture_cases() -> list:
 @pytest.mark.parametrize("fixture", _client_fixture_cases())
 def test_client_fixture(client: TestClient, fixture: dict) -> None:
     expected = fixture["expected"]
-    want_status = LIVE_OVERRIDES.get(fixture["name"], (expected["status"], ""))[0]
+    want_status, want_url, _ = LIVE_OVERRIDES.get(
+        fixture["name"], (expected["status"], expected.get("best_url"), "")
+    )
     http_status, body = _resolve(client, fixture["input"]["secid"])
     assert http_status == 200, body
     assert body.get("status") == want_status, body
-    if expected.get("best_url"):
-        assert expected["best_url"] in _urls(body), body
+    if want_url:
+        assert want_url in _urls(body), body
 
 
 # ---------------------------------------------------------------------------
@@ -284,11 +299,15 @@ TARGETED_CASES = [
     Case("overlong-namespace-segment", "secid:advisory/" + "a" * 256 + ".com/x", "not_found"),
 
     # --- cross-source ordering and bare identifiers
-    Case("tie-order-matches-live", "secid:control/IAM-12", "found", result_secids=[
-        "secid:control/cloudsecurityalliance.org/aicm-caiq#IAM-12",
-        "secid:control/cloudsecurityalliance.org/aicm#IAM-12",
+    Case("tie-order-matches-live", "secid:regulation/art-32", "found", result_secids=[
+        "secid:regulation/europa.eu/gdpr#art-32",
+        "secid:regulation/ppc.go.jp/appi#art-32",
+        "secid:regulation/europa.eu/ai-act#art-32",
+        "secid:regulation/europa.eu/dora#art-32",
+        "secid:regulation/europa.eu/nis2#art-32",
+    ]),
+    Case("cross-source-skips-version-required", "secid:control/IAM-12", "found", result_secids=[
         "secid:control/cloudsecurityalliance.org/ccm-caiq#IAM-12",
-        "secid:control/cloudsecurityalliance.org/ccm#IAM-12",
     ]),
     Case("bare-source-name", "cwe", "found", result_secids=[
         "secid:entity/mitre.org/cwe", "secid:weakness/mitre.org/cwe",
