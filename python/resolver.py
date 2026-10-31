@@ -747,7 +747,7 @@ class _Resolution:
             self.q, "not_found", [],
             f'Version "{p.version}" is not a known version of {slug}. Known versions: {_describe_versions(node)}. '
             f'To list versions, describe the source without a version (secid:{p.type}/{p.namespace}/{slug}). '
-            f'Report a genuinely missing release via the submit_feedback tool (include a source URL) or {ISSUES_URL}',
+            f'Report a genuinely missing release at {ISSUES_URL}',
         )
 
     def _version_required_miss(self, node: dict) -> dict:
@@ -1214,7 +1214,7 @@ class RegistryIndex:
         as_is = self._resolve_once(query)
         if as_is["status"] in ("found", "corrected"):
             return as_is
-        if not re.search(r"%[0-9A-Fa-f]{2}", query):
+        if "%" not in query or re.search(r"%(?![0-9A-Fa-f]{2})", query):
             return as_is
         try:
             decoded = urllib.parse.unquote(query, errors="strict")
