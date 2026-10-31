@@ -46,25 +46,43 @@ def cap_string(value: str) -> str:
     return _CONTROL_RE.sub("", value)[:MAX_FIELD_CHARS]
 
 
+def _cap_value(value: Any) -> Any:
+    """Strip control chars and cap lengths without re-wrapping nested dicts."""
+    if isinstance(value, str):
+        return cap_string(value)
+    if isinstance(value, list):
+        return [_cap_value(v) for v in value[:MAX_ARRAY_ITEMS]]
+    if isinstance(value, dict):
+        return {k: _cap_value(v) for k, v in value.items()}
+    return value
+
+
 def _sanitize_value(value: Any) -> Any:
     if isinstance(value, str):
         return cap_string(value)
     if isinstance(value, list):
         return [_sanitize_value(v) for v in value[:MAX_ARRAY_ITEMS]]
     if isinstance(value, dict):
-        return {k: _sanitize_value(v) for k, v in value.items()}
+        return _sanitize_dict(value)
     return value
 
 
-def _sanitize_data(data: dict) -> dict:
+def _sanitize_dict(data: dict) -> dict:
     out: dict = {}
     untrusted: dict = {}
     for key, value in data.items():
-        (untrusted if key in UNTRUSTED_TEXT_KEYS else out)[key] = _sanitize_value(value)
+        if key in UNTRUSTED_TEXT_KEYS:
+            untrusted[key] = _cap_value(value)
+        else:
+            out[key] = _sanitize_value(value)
     if untrusted:
         untrusted["_warning"] = UNTRUSTED_WARNING
         out["registry_text_untrusted"] = untrusted
     return out
+
+
+# Backwards-compatible alias for internal callers/tests.
+_sanitize_data = _sanitize_dict
 
 
 def sanitize_response_for_mcp(result: Any) -> Any:
@@ -81,11 +99,6 @@ def sanitize_response_for_mcp(result: Any) -> Any:
             if not isinstance(entry, dict):
                 entries.append(entry)
                 continue
-            e = {k: (cap_string(v) if isinstance(v, str) else v) for k, v in entry.items() if k != "data"}
-            if isinstance(entry.get("data"), dict):
-                e["data"] = _sanitize_data(entry["data"])
-            elif "data" in entry:
-                e["data"] = entry["data"]
-            entries.append(e)
+            entries.append(_sanitize_dict(entry))
         out["results"] = entries
     return out
