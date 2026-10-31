@@ -26,7 +26,6 @@ SecID-Server-API/
 │   ├── test_real_registry.py # Real registry + SecID-Client-SDK fixtures, both load modes
 │   └── requirements.txt
 ├── typescript/              # TypeScript implementation (planned, README only)
-├── go/                      # Go implementation (planned, README only)
 ├── docker/                  # Dockerfile and compose (planned, README only)
 ├── tests/                   # Pointer to the shared conformance suite in SecID-Client-SDK
 ├── .github/workflows/       # CI: runs pytest on the Python matrix
@@ -35,7 +34,7 @@ SecID-Server-API/
 ```
 
 - `python/` is the active reference implementation (`secid_server.py` factory + CLI, `resolver.py` port of SecID-Service, `registry_loader.py`, `storage.py`, `sanitize.py` MCP output envelope). Tests: `test_smoke.py`, `test_real_registry.py`.
-- `typescript/` and `go/` are placeholders for the planned production-throughput implementations.
+- `typescript/` (README placeholder) and `go/` (planned, directory not yet created) are the planned production-throughput implementations.
 - `tests/` points at the shared conformance suite, which lives in `SecID-Client-SDK`.
 - `docker/` documents planned containerization (no Dockerfile or image yet).
 - `.github/workflows/test.yml` runs the Python test suite (smoke + real-registry) on every PR.
