@@ -47,8 +47,8 @@ Not directly applicable:
 - **Human / agent operations:** Governed autonomously by the SecID governing agent ([`CSA-Internal-Governance/SecID`](https://github.com/CSA-Internal-Governance/SecID)) with mandatory two-agent cross-vendor code review (`AGENTS.md`).
 - **Total ongoing FTE:** < 0.03 human FTE.
 - **Automation / minimization strategy:**
-  - `python/test_real_registry.py` automatically tests all structured examples in `CloudSecurityAlliance/SecID` and all shared fixtures in `CloudSecurityAlliance/SecID-Client-SDK` in both `lazy` and `bulk` load modes.
-- **Burden-exceeds-value / sunset trigger:** Keep the Python implementation as the canonical reference server; only build the planned TypeScript, Go, or Docker distributions when concrete external demand warrants the additional maintenance surface.
+  - `python/test_real_registry.py` automatically tests structured examples in `CloudSecurityAlliance/SecID` (skipping `version_required` sources that require an explicit `@version` on unversioned source lookups) and all applicable server-resolution fixtures in `CloudSecurityAlliance/SecID-Client-SDK` (`tests/conformance/fixtures.json` plus the real-namespace resolution cases in `tests/fixtures.json`, excluding client-side transport/mock-only fixtures) in both `lazy` and `bulk` load modes.
+- **Burden-exceeds-value / sunset trigger:** Keep the Python implementation as the canonical reference server and defer the planned TypeScript, Go, or Docker distributions until concrete external demand warrants the additional maintenance surface. Reconsider maintaining the separate Python port if keeping parity with `SecID-Service` exceeds 4 hours/month of engineering effort or if packaging `SecID-Service`'s TypeScript resolver directly in a self-hosted container replaces the need for a separate language port.
 
 ### Risks and mitigations
 

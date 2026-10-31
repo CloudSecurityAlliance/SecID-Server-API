@@ -11,13 +11,13 @@ Provide a clear, safe-by-default, self-hostable SecID server that organizations 
 - **Objective:** Maintain a second independent, spec-conformant reference implementation of the SecID resolver and MCP server to validate specification portability and catch edge cases across runtimes.
   - **Success metrics:**
     - 100% pass rate across `python/test_smoke.py` and `python/test_real_registry.py` on Python 3.10–3.13 in CI (`.github/workflows/test.yml`).
-    - 100% pass rate against the shared [`SecID-Client-SDK`](https://github.com/CloudSecurityAlliance/SecID-Client-SDK) client fixtures (`tests/fixtures.json`) and resolver conformance suite (`tests/conformance/fixtures.json`) in both `lazy` and `bulk` load modes.
+    - 100% pass rate against the applicable [`SecID-Client-SDK`](https://github.com/CloudSecurityAlliance/SecID-Client-SDK) client fixtures (`tests/fixtures.json`, excluding client-transport and synthetic-namespace mock cases) and resolver conformance suite (`tests/conformance/fixtures.json`) in both `lazy` and `bulk` load modes.
 
 ## Community & Ecosystem Goals
 
 - **Objective:** Enable enterprise and air-gapped deployments with private registry overlays and pluggable storage backends.
   - **Success metrics:**
-    - Deterministic overlay precedence (`--registry` later directories override earlier ones by namespace in both `lazy` and `bulk` modes) verified by automated tests across `memory`, `sqlite`, `redis`, and `memcached` storage adapters (`python/storage.py`).
+    - Deterministic overlay precedence (`--registry` later directories override earlier ones by namespace in both `lazy` and `bulk` modes) verified by automated CI tests on the `memory` backend (`python/test_smoke.py`), with pluggable adapters implemented for `sqlite`, `redis`, and `memcached` in `python/storage.py` (adding automated CI test containers for `sqlite`/`redis`/`memcached` is a tracked future target).
     - Zero-downtime incremental registry reload (`POST /admin/reload` using `git diff` in `python/registry_loader.py`) correctly handles additions, modifications, deletions, and in-place namespace renames.
 - **Objective:** Guarantee a safe-by-default security posture for self-hosted operators and MCP clients.
   - **Success metrics:**
