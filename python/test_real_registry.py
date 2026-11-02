@@ -188,12 +188,7 @@ def _conformance_cases() -> list:
     return [pytest.param(t, id=t["name"]) for t in tests]
 
 
-CONFORMANCE_LIVE_OVERRIDES = {
-    # After SecID-Service#33 (c8b3a93), a source without version_required or
-    # versions_available (first.org/cvss models 4.0 as a subpath child #4.0,
-    # not @version) drops @4.0 and returns status="corrected".
-    "resolve-cvss-40": {"response_status": "corrected"},
-}
+CONFORMANCE_LIVE_OVERRIDES: dict[str, dict] = {}
 
 
 @pytest.mark.parametrize("fixture", _conformance_cases())
@@ -275,8 +270,8 @@ TARGETED_CASES = [
          "found", first_secid="secid:control/cloudsecurityalliance.org/ccm@4.0#IAM-12"),
     Case("describe-version", "secid:control/nist.gov/csf@2.0",
          "found", first_secid="secid:control/nist.gov/csf@2.0"),
-    Case("unversioned-source-version-dropped", "secid:methodology/first.org/cvss@4.0",
-         "corrected", first_secid="secid:methodology/first.org/cvss"),
+    Case("unversioned-source-version-dropped", "secid:methodology/first.org/epss@1.0",
+         "corrected", first_secid="secid:methodology/first.org/epss"),
 
     # --- lookup_table (own-key semantics)
     Case("lookup-table-versioned", "secid:weakness/owasp.org/llm-top10@2.0#LLM01",
