@@ -65,3 +65,23 @@ jobs:
       - name: Run tests
         working-directory: python
         run: pytest -v -rs
+
+  ci-passed:
+    name: ci-passed
+    if: always()
+    needs:
+      - python
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require all Python matrix jobs to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Gate results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::A required CI gate did not succeed ($r)."
+              exit 1
+            fi
+          done
