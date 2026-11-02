@@ -136,6 +136,12 @@ LIVE_OVERRIDES = {
         "After SecID#207 migrated CCM to version_required version nodes, "
         "ccm@4.0#A&A-01 resolves to a data-only control description (no per-control URL).",
     ),
+    "found_unknown_envelope_and_result_fields": (
+        "not_found",
+        None,
+        "Synthetic forward-compatibility client mock fixture using regulation/bsi.bund.de "
+        "(bsi.bund.de is registered under control, not regulation, in the live registry).",
+    ),
 }
 
 
