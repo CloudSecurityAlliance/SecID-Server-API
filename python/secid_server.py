@@ -38,7 +38,7 @@ from fastapi.responses import JSONResponse
 
 from storage import create_store
 from registry_loader import SECID_TYPES, bulk_load, list_all_types, loaded_commits, update_load
-from resolver import RegistryIndex
+from resolver import MAX_SECID_QUERY_CHARS, RegistryIndex
 from sanitize import sanitize_response_for_mcp
 
 logger = logging.getLogger(__name__)
@@ -172,14 +172,34 @@ def create_app(config: ServerConfig) -> FastAPI:
             None,
             description="Filter results by parsability: 'structured' or 'scraped'",
         ),
+        content_type: Optional[str] = Query(
+            None,
+            description="Filter results by MIME content_type (e.g. 'application/json')",
+        ),
+        lang: Optional[str] = Query(
+            None,
+            description="Filter or select language code (e.g. 'de', 'fr')",
+        ),
     ):
         """Resolve a SecID string to URLs and registry data."""
-        result = run_resolve(secid)
-        if parsability and "results" in result:
-            result["results"] = [
-                r for r in result["results"]
-                if "url" not in r or r.get("parsability") == parsability
-            ]
+        extra_qualifiers = {
+            k: v
+            for k, v in (
+                ("parsability", parsability),
+                ("content_type", content_type),
+                ("lang", lang),
+            )
+            if v
+        }
+        extra_len = sum(len(k) + len(v) + 2 for k, v in extra_qualifiers.items())
+        if len(secid) + extra_len > MAX_SECID_QUERY_CHARS:
+            return JSONResponse(content={
+                "secid_query": secid[:MAX_SECID_QUERY_CHARS],
+                "status": "error",
+                "results": [],
+                "message": f"Query too long: SecID queries are limited to {MAX_SECID_QUERY_CHARS} characters.",
+            })
+        result = index.resolve(secid, qualifiers=extra_qualifiers or None)
         return JSONResponse(content=result)
 
     @app.get("/api/v1/types")

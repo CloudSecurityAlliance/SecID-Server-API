@@ -212,7 +212,8 @@ def extract_secid_type(value: str) -> Optional[str]:
     if not remaining:
         return None
     head = remaining.split("#", 1)[0]
-    candidate = head.split("/", 1)[0].lower()
+    path_part = head.split("?", 1)[0]
+    candidate = path_part.split("/", 1)[0].lower()
     return candidate if candidate in SECID_TYPES else None
 
 
@@ -259,17 +260,21 @@ def parse_secid(value: str, has_namespace: Callable[[str], bool]) -> ParsedSecID
     if not head:
         return parsed
 
+    source_qualifiers = None
+    if "?" in head:
+        head, _, q = head.partition("?")
+        source_qualifiers = _parse_qualifiers(q)
+    if not head:
+        return parsed
+
     type_candidate, slash, remaining = head.partition("/")
     if type_candidate.lower() not in SECID_TYPES:
         return parsed
     parsed.type = type_candidate.lower()
     if not slash or not remaining:
+        if source_qualifiers or item_qualifiers:
+            parsed.qualifiers = {**(source_qualifiers or {}), **(item_qualifiers or {})}
         return parsed
-
-    source_qualifiers = None
-    if "?" in remaining:
-        remaining, _, q = remaining.partition("?")
-        source_qualifiers = _parse_qualifiers(q)
 
     segments = remaining.split("/")
     longest, match_len = None, 0
@@ -711,9 +716,26 @@ class _Resolution:
         if node is None:
             corrected = self.namespace_scoped_search(ns)
             if corrected:
-                return _response(self.q, "corrected", corrected)
+                filtered = _apply_qualifier_filters(corrected, p.qualifiers)
+                if filtered is None:
+                    return _qualifier_not_found(self.q, corrected, p.qualifiers)
+                return _response(self.q, "corrected", filtered)
+            if (p.qualifiers or {}).get("lang"):
+                identifier = p.name + (p.subpath or "")
+                for n in _match_nodes(ns):
+                    if _node_data(n).get("version_required"):
+                        continue
+                    msg = _lang_not_found_message(
+                        _children(n), identifier, p.qualifiers["lang"], scoped=False,
+                    )
+                    if msg:
+                        return _response(self.q, "not_found", [], msg)
             type_results = self.type_scoped_search()
-            if type_results["results"]:
+            if type_results["results"] or (
+                p.qualifiers
+                and type_results["status"] == "not_found"
+                and not (type_results.get("message") or "").startswith("No results found for ")
+            ):
                 return type_results
             return _response(self.q, "related", self.list_sources(ns)["results"],
                              f'Name "{p.name}" not found in {p.namespace}. Available sources listed.')
@@ -939,13 +961,21 @@ class _Resolution:
         _sort_resolution_first(results)
         return results
 
-    def _child_hit(self, secid: str, child: dict, identifier: str, node: dict) -> dict:
+    def _child_hit(self, secid: str, child: dict, identifier: str, node: dict) -> Optional[dict]:
+        qualifiers = self.p.qualifiers or {}
+        cd = _node_data(child)
+        lang = cd.get("lang") if isinstance(cd.get("lang"), dict) else None
+        if qualifiers.get("lang") and lang and qualifiers["lang"] not in (lang.get("available") or []):
+            return None
         url = _resolve_child_url(child, identifier, node, self.p.qualifiers)
         if url:
-            return _resolution_result(secid, child.get("weight"), url, _node_data(child))
+            res = _resolution_result(secid, child.get("weight"), url, cd)
+            if lang:
+                res["lang"] = qualifiers.get("lang") or lang.get("default")
+            return res
         return {"secid": secid, "data": {"description": child.get("description"),
                                          "weight": child.get("weight"),
-                                         "note": _node_data(child).get("note")}}
+                                         "note": cd.get("note")}}
 
     def namespace_scoped_search(self, ns: dict) -> list:
         """The name matched no source: treat it as an item identifier within
@@ -958,7 +988,9 @@ class _Resolution:
                 if not node_matches(child, identifier, True):
                     continue
                 secid = f"secid:{p.type}/{p.namespace}/{extract_name_slug(node)}#{identifier}"
-                results.append(self._child_hit(secid, child, identifier, node))
+                hit = self._child_hit(secid, child, identifier, node)
+                if hit is not None:
+                    results.append(hit)
         results.sort(key=lambda r: -_weight(r))
         return results
 
@@ -1007,15 +1039,30 @@ class _Resolution:
                     if not node_matches(child, identifier, False):
                         continue
                     secid = f"secid:{p.type}/{ns_key}/{slug}#{identifier}"
-                    results.append(self._child_hit(secid, child, identifier, node))
+                    hit = self._child_hit(secid, child, identifier, node)
+                    if hit is not None:
+                        results.append(hit)
         if not results:
+            if (p.qualifiers or {}).get("lang"):
+                for ns in self.reg.values():
+                    for node in _match_nodes(ns):
+                        if _node_data(node).get("version_required"):
+                            continue
+                        msg = _lang_not_found_message(
+                            _children(node), identifier, p.qualifiers["lang"], scoped=False,
+                        )
+                        if msg:
+                            return _response(self.q, "not_found", [], msg)
             return _response(
                 self.q, "not_found", [],
                 f'No results found for "{identifier}" in type "{p.type}". If this source should be '
                 f"covered, request it at {ISSUES_URL}",
             )
-        results.sort(key=lambda r: (-_weight(r), _locale_key(r.get("secid", ""))))
-        return _response(self.q, "found", results)
+        filtered = _apply_qualifier_filters(results, p.qualifiers)
+        if filtered is None:
+            return _qualifier_not_found(self.q, results, p.qualifiers)
+        filtered.sort(key=lambda r: (-_weight(r), _locale_key(r.get("secid", ""))))
+        return _response(self.q, "found", filtered)
 
 
 def _apply_qualifier_filters(results: list, qualifiers: Optional[dict]) -> Optional[list]:
@@ -1025,10 +1072,12 @@ def _apply_qualifier_filters(results: list, qualifiers: Optional[dict]) -> Optio
     for key in ("content_type", "parsability"):
         if qualifiers.get(key):
             target = qualifiers[key]
-            filtered = [r for r in filtered if "url" not in r or r.get(key) == target]
+            filtered = [r for r in filtered if "url" in r and r.get(key) == target]
     if qualifiers.get("lang"):
         target = qualifiers["lang"]
         filtered = [r for r in filtered if "url" not in r or not r.get("lang") or r["lang"] == target]
+    if not filtered and results:
+        return None
     if not any("url" in r for r in filtered) and any("url" in r for r in results):
         return None
     return filtered
@@ -1036,21 +1085,38 @@ def _apply_qualifier_filters(results: list, qualifiers: Optional[dict]) -> Optio
 
 def _qualifier_not_found(query: str, results: list, qualifiers: dict) -> dict:
     parts = []
+    active_keys = [k for k in ("content_type", "parsability", "lang") if qualifiers.get(k)]
+    multi = len(active_keys) > 1
     if qualifiers.get("content_type"):
         available = sorted({r["content_type"] for r in results if "url" in r and r.get("content_type")})
-        parts.append(f'No results with content_type "{qualifiers["content_type"]}". '
-                     f'Available: {", ".join(available) or "none declared"}.')
+        if not multi or qualifiers["content_type"] not in available:
+            parts.append(f'No results with content_type "{qualifiers["content_type"]}". '
+                         f'Available: {", ".join(available) or "none declared"}.')
+    if qualifiers.get("parsability"):
+        available = sorted({r["parsability"] for r in results if "url" in r and r.get("parsability")})
+        if not multi or qualifiers["parsability"] not in available:
+            parts.append(f'No results with parsability "{qualifiers["parsability"]}". '
+                         f'Available: {", ".join(available) or "none declared"}.')
     if qualifiers.get("lang"):
         available = sorted({r["lang"] for r in results if "url" in r and r.get("lang")})
-        parts.append(f'No results for lang "{qualifiers["lang"]}". '
-                     f'Available: {", ".join(available) or "none declared"}.')
+        if not multi or qualifiers["lang"] not in available:
+            parts.append(f'No results for lang "{qualifiers["lang"]}". '
+                         f'Available: {", ".join(available) or "none declared"}.')
+    if not parts:
+        active = ", ".join(
+            f'{k}="{qualifiers[k]}"'
+            for k in active_keys
+        )
+        parts.append(f"No results matching combined qualifiers ({active}).")
     parts.append("Remove qualifiers to see all results.")
     return _response(query, "not_found", [], " ".join(parts))
 
 
-def _lang_not_found_message(children: list, subpath: str, lang: str) -> Optional[str]:
+def _lang_not_found_message(
+    children: list, subpath: str, lang: str, scoped: bool = True,
+) -> Optional[str]:
     for child in children:
-        if not matches_any_pattern(child.get("patterns", []), subpath):
+        if not node_matches(child, subpath, scoped):
             continue
         cfg = _node_data(child).get("lang")
         if isinstance(cfg, dict) and lang not in (cfg.get("available") or []):
@@ -1205,13 +1271,19 @@ class RegistryIndex:
 
     # -- orchestration -------------------------------------------------------
 
-    def resolve(self, query: str) -> dict:
+    @staticmethod
+    def _merge_qualifiers(inline: Optional[dict], extra: Optional[dict]) -> Optional[dict]:
+        if not extra:
+            return inline
+        return {**extra, **(inline or {})}
+
+    def resolve(self, query: str, qualifiers: Optional[dict] = None) -> dict:
         if len(query) > MAX_SECID_QUERY_CHARS:
             return _response(
                 query[:MAX_SECID_QUERY_CHARS], "error", [],
                 f"Query too long: SecID queries are limited to {MAX_SECID_QUERY_CHARS} characters.",
             )
-        as_is = self._resolve_once(query)
+        as_is = self._resolve_once(query, qualifiers)
         if as_is["status"] in ("found", "corrected"):
             return as_is
         if "%" not in query or re.search(r"%(?![0-9A-Fa-f]{2})", query):
@@ -1222,12 +1294,12 @@ class RegistryIndex:
             return as_is
         if decoded == query or len(decoded) > MAX_SECID_QUERY_CHARS:
             return as_is
-        alt = self._resolve_once(decoded)
+        alt = self._resolve_once(decoded, qualifiers)
         if _STATUS_RANK.get(alt["status"], 0) > _STATUS_RANK.get(as_is["status"], 0):
             return {**alt, "secid_query": query}
         return as_is
 
-    def _resolve_once(self, query: str) -> dict:
+    def _resolve_once(self, query: str, extra_qualifiers: Optional[dict] = None) -> dict:
         trimmed = query.strip()
         if not trimmed:
             return _response(query, "error", [], "Empty query. Provide a SecID string.")
@@ -1238,14 +1310,17 @@ class RegistryIndex:
         secid_type = extract_secid_type(trimmed)
         if not secid_type:
             if trimmed[:6].lower() != "secid:":
-                bare = self._search_bare_identifier(query, trimmed)
+                bare = self._search_bare_identifier(query, trimmed, extra_qualifiers)
                 if bare:
                     return bare
                 return _bare_search_not_found(query, trimmed)
-            return _Resolution(parse_secid(query, lambda _c: False), {}, self.aliases).run()
+            parsed = parse_secid(query, lambda _c: False)
+            parsed.qualifiers = self._merge_qualifiers(parsed.qualifiers, extra_qualifiers)
+            return _Resolution(parsed, {}, self.aliases).run()
 
         ns_map = self.namespaces(secid_type)
         parsed = parse_secid(query, lambda candidate: candidate in ns_map)
+        parsed.qualifiers = self._merge_qualifiers(parsed.qualifiers, extra_qualifiers)
         if not ns_map:
             return _Resolution(parsed, {}, self.aliases).run()
 
@@ -1334,11 +1409,22 @@ class RegistryIndex:
             "namespaces": [_namespace_listing_entry(ns, ns_map[ns]) for ns in sorted(ns_map)],
         }}])
 
-    def _search_bare_identifier(self, query: str, trimmed: str) -> Optional[dict]:
+    def _search_bare_identifier(
+        self,
+        query: str,
+        raw_trimmed: str,
+        extra_qualifiers: Optional[dict] = None,
+    ) -> Optional[dict]:
         """No type and no 'secid:' prefix: search every type (e.g. "cwe",
         "CVE-2021-44228"). Open patterns never answer a bare term."""
-        if len(trimmed) > MAX_REGEX_INPUT:
+        if len(raw_trimmed) > MAX_REGEX_INPUT:
             return None
+        trimmed_part, sep, q_part = raw_trimmed.partition("?")
+        trimmed = trimmed_part.strip()
+        if not trimmed:
+            return None
+        inline_qualifiers = _parse_qualifiers(q_part) if sep else None
+        qualifiers = self._merge_qualifiers(inline_qualifiers, extra_qualifiers)
         needle = trimmed.lower()
         source_matches: list[tuple[str, str, str]] = []
         child_matches: dict[str, dict[str, None]] = {}
@@ -1355,20 +1441,41 @@ class RegistryIndex:
         if not source_matches and not child_matches:
             return None
 
+        resolve_results: list[dict] = []
         results: list = []
         for secid_type, ns_key, slug in source_matches:
-            parsed = ParsedSecID(raw=query, type=secid_type, namespace=ns_key, name=slug)
+            parsed = ParsedSecID(raw=query, type=secid_type, namespace=ns_key, name=slug, qualifiers=qualifiers)
             ns_map = self.namespaces(secid_type)
-            results += _Resolution(parsed, {ns_key: ns_map[ns_key]}, self.aliases).run()["results"]
+            res = _Resolution(parsed, {ns_key: ns_map[ns_key]}, self.aliases).run()
+            resolve_results.append(res)
+            results += res["results"]
         for secid_type, namespaces in child_matches.items():
-            parsed = ParsedSecID(raw=query, type=secid_type, name=trimmed)
+            parsed = ParsedSecID(raw=query, type=secid_type, name=trimmed, qualifiers=qualifiers)
             ns_map = self.namespaces(secid_type)
             subset = {ns: ns_map[ns] for ns in namespaces}
-            results += _Resolution(parsed, subset, self.aliases).run()["results"]
-        if not results:
+            res = _Resolution(parsed, subset, self.aliases).run()
+            resolve_results.append(res)
+            results += res["results"]
+
+        filtered = _apply_qualifier_filters(results, qualifiers) if qualifiers else results
+        if not filtered:
+            if qualifiers:
+                if results:
+                    return _qualifier_not_found(query, results, qualifiers)
+                qualifier_miss = next(
+                    (
+                        r for r in resolve_results
+                        if r["status"] == "not_found"
+                        and r.get("message")
+                        and not r["message"].startswith("No results found for ")
+                    ),
+                    None,
+                )
+                if qualifier_miss:
+                    return _response(query, "not_found", [], qualifier_miss["message"])
             return None
-        _sort_resolution_first(results)
-        return _response(query, "found", results)
+        _sort_resolution_first(filtered)
+        return _response(query, "found", filtered)
 
 
 def index_for(store: Store, registry_dirs: Optional[list[str]] = None) -> RegistryIndex:
@@ -1382,6 +1489,11 @@ def index_for(store: Store, registry_dirs: Optional[list[str]] = None) -> Regist
     return index
 
 
-def resolve(store: Store, secid_query: str, registry_dirs: Optional[list[str]] = None) -> dict:
+def resolve(
+    store: Store,
+    secid_query: str,
+    registry_dirs: Optional[list[str]] = None,
+    qualifiers: Optional[dict] = None,
+) -> dict:
     """Resolve a SecID string. Returns the API response envelope."""
-    return index_for(store, registry_dirs).resolve(secid_query)
+    return index_for(store, registry_dirs).resolve(secid_query, qualifiers=qualifiers)

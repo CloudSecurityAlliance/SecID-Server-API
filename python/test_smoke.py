@@ -645,13 +645,167 @@ def test_id_lower_and_upper_variables():
 
 
 def test_parse_qualifiers_source_and_item_level():
-    from resolver import parse_secid
+    from resolver import extract_secid_type, parse_secid
     p = parse_secid(
         "secid:regulation/europa.eu/gdpr?lang=fr&x=1#art-32?lang=de",
         lambda c: c == "europa.eu",
     )
     assert (p.type, p.namespace, p.name, p.subpath) == ("regulation", "europa.eu", "gdpr", "art-32")
     assert p.qualifiers == {"lang": "de", "x": "1"}  # item-level wins
+
+    # MIME slash inside source-level qualifier must not split head into a fake segment.
+    t_only = parse_secid(
+        "secid:advisory?content_type=application/json",
+        lambda _c: False,
+    )
+    assert (t_only.type, t_only.namespace, t_only.name, t_only.subpath) == ("advisory", None, None, None)
+    assert t_only.qualifiers == {"content_type": "application/json"}
+    assert extract_secid_type("secid:advisory?content_type=application/json") == "advisory"
+
+
+def test_qualifier_filtering_cross_source_bare_and_http_params(tmp_path):
+    """Issue #3 + SecID-Service#55 parity: qualifiers filter cross-source search,
+    bare-identifier search, URL-less results, and top-level /api/v1/resolve query params."""
+    reg = tmp_path / "registry"
+    _write_ns(reg, "advisory", "org/mitre.json", "mitre.org", [{
+        "patterns": ["(?i)^cve$"], "description": "CVE", "weight": 100, "data": {},
+        "children": [
+            {
+                "patterns": ["^CVE-\\d{4}-\\d{4,}$"], "description": "CVE Record (HTML)", "weight": 100,
+                "data": {
+                    "url": "https://www.cve.org/CVERecord?id={id}",
+                    "content_type": "text/html",
+                    "parsability": "scraped",
+                },
+            },
+            {
+                "patterns": ["^CVE-\\d{4}-\\d{4,}$"], "description": "CVE API (JSON)", "weight": 95,
+                "data": {
+                    "url": "https://cveawg.mitre.org/api/cve/{id}",
+                    "content_type": "application/json",
+                    "parsability": "structured",
+                },
+            },
+        ],
+    }])
+    _write_ns(reg, "advisory", "com/oracle.json", "oracle.com", [{
+        "patterns": ["(?i)^vm$"], "description": "Oracle VM", "weight": 60, "data": {},
+        "children": [{
+            "patterns": ["^OVMSA-\\d{4}-\\d{4}$"], "description": "OVMSA", "weight": 60,
+            "data": {"note": "Format documented, no per-advisory URL"},
+        }],
+    }])
+    _write_ns(reg, "regulation", "eu/europa.json", "europa.eu", [{
+        "patterns": ["(?i)^gdpr$"], "description": "GDPR", "weight": 100,
+        "data": {"url": "https://eur-lex.europa.eu/EN"},
+        "children": [{
+            "patterns": ["^art-\\d+$"], "description": "Article", "weight": 100,
+            "data": {
+                "url": "https://eur-lex.europa.eu/{lang}/{id}",
+                "content_type": "text/html",
+                "parsability": "scraped",
+                "lang": {
+                    "default": "en",
+                    "available": ["en", "de"],
+                    "url_transform": "uppercase",
+                },
+            },
+        }],
+    }])
+
+    for mode in ("lazy", "bulk"):
+        client = TestClient(create_app(ServerConfig(registry_dirs=[str(reg)], load_mode=mode)))
+
+        # 1. Cross-source search with inline ?parsability=structured returns only JSON URL
+        r1 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory/CVE-2026-0019?parsability=structured",
+        }).json()
+        assert r1["status"] == "found"
+        assert _urls(r1) == ["https://cveawg.mitre.org/api/cve/CVE-2026-0019"]
+
+        # 2. Bare identifier search with ?parsability=structured
+        r2 = client.get("/api/v1/resolve", params={
+            "secid": "CVE-2026-0019?parsability=structured",
+        }).json()
+        assert r2["status"] == "found"
+        assert _urls(r2) == ["https://cveawg.mitre.org/api/cve/CVE-2026-0019"]
+
+        # 3. URL-less child result is excluded when parsability or content_type is requested
+        r3 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory/oracle.com/vm#OVMSA-2024-0001?parsability=structured",
+        }).json()
+        assert r3["status"] == "not_found"
+        assert 'No results with parsability "structured"' in r3["message"]
+
+        # 4. Cross-source search with ?lang=de and unavailable ?lang=xx
+        r4 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32?lang=de",
+        }).json()
+        assert r4["status"] == "found"
+        assert _urls(r4) == ["https://eur-lex.europa.eu/DE/art-32"]
+
+        r4_miss = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32?lang=xx",
+        }).json()
+        assert r4_miss["status"] == "not_found"
+        assert 'Language "xx" not available' in r4_miss["message"]
+
+        # 5. Top-level HTTP query param ?parsability=structured (when caller didn't URL-encode ?)
+        r5 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory/CVE-2026-0019",
+            "parsability": "structured",
+        }).json()
+        assert r5["status"] == "found"
+        assert _urls(r5) == ["https://cveawg.mitre.org/api/cve/CVE-2026-0019"]
+
+        # 6. Inline SecID qualifier (including uppercase key) takes precedence over top-level param
+        r6 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory/CVE-2026-0019?PARSABILITY=structured",
+            "parsability": "scraped",
+        }).json()
+        assert r6["status"] == "found"
+        assert _urls(r6) == ["https://cveawg.mitre.org/api/cve/CVE-2026-0019"]
+
+        # 7. Source-level qualifier before # combined with top-level &lang=de does not corrupt #subpath
+        r7 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/europa.eu/gdpr?content_type=text/html#art-32",
+            "lang": "de",
+        }).json()
+        assert r7["status"] == "found"
+        assert _urls(r7) == ["https://eur-lex.europa.eu/DE/art-32"]
+
+        # 8. Parameter-pollution attempt in top-level content_type cannot smuggle a second qualifier
+        r8 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory/mitre.org/cve#CVE-2026-0019",
+            "content_type": "text/html&parsability=scraped",
+        }).json()
+        assert r8["status"] == "not_found"
+        assert "text/html&parsability=scraped" in r8["message"]
+
+        # 9. Type-only query with ?content_type=application/json lists advisory namespaces, not "json"
+        r9 = client.get("/api/v1/resolve", params={
+            "secid": "secid:advisory",
+            "content_type": "application/json",
+        }).json()
+        assert r9["status"] == "found"
+        assert r9["results"][0]["secid"] == "secid:advisory"
+
+        # 10. Cross-source default-language result preserves declared weight (100, not 101)
+        r10 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32",
+        }).json()
+        assert r10["status"] == "found"
+        assert r10["results"][0]["weight"] == 100
+
+        # 11. Combined filter miss blames only the unsatisfied qualifier (parsability), not available lang
+        r11 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32?parsability=structured&lang=de",
+        }).json()
+        assert r11["status"] == "not_found"
+        assert 'No results with parsability "structured"' in r11["message"]
+        assert 'No results for lang "de"' not in r11["message"]
+
+
 
 
 def test_locale_key_orders_hyphen_before_hash():
