@@ -118,3 +118,13 @@ pytest -v -rs
 | **[SecID-Service](https://github.com/CloudSecurityAlliance/SecID-Service)** | Cloudflare-hosted production service |
 | **[SecID-Server-API](https://github.com/CloudSecurityAlliance/SecID-Server-API)** (this repo) | Self-hosted resolver |
 | **[SecID-Client-SDK](https://github.com/CloudSecurityAlliance/SecID-Client-SDK)** | Client libraries (Python, TypeScript, Go) |
+
+## Code Review Rules
+
+When running an independent code review (`codex review --base main`, `codex exec`, Claude Code Review via [`REVIEW.md`](REVIEW.md), or human/agent review), check every PR against [`REVIEW.md`](REVIEW.md):
+
+1. **Authority, provenance, and CI guardrails:** Verify `AI-Agent: <Name>` commit trailers and `*Agent: <Name> (SecID governing agent)*` PR headers; require an independent cross-vendor review for any change to `.github/workflows/test.yml`, `AGENTS.md`, or `REVIEW.md`; and never commit runtime secrets or private registry overlays.
+2. **MCP output sanitization (`python/sanitize.py`):** Verify that all MCP tools pass output through `sanitize_response_for_mcp()`, recursively relocating `UNTRUSTED_TEXT_KEYS` into `registry_text_untrusted`, stripping control/bidi characters, and enforcing `MAX_FIELD_CHARS`/`MAX_ARRAY_ITEMS` in lockstep with `SecID-Service/src/sanitize.ts`.
+3. **Endpoint security & `/admin/reload` auth (`python/secid_server.py`, `python/resolver.py`):** Ensure `POST /admin/reload` fails closed (`401`) without a valid `X-Reload-Token` (`hmac.compare_digest`), serializes reloads under lock, and preserves `http`/`https` URL hardening and query input bounds.
+4. **Resolver parity & dual-mode testing:** Keep `TYPE_REGISTRY` and resolution behavior aligned with `SecID-Service`, and verify `pytest` passes across `python/test_smoke.py` and `python/test_real_registry.py` (`lazy` and `bulk` load modes).
+
