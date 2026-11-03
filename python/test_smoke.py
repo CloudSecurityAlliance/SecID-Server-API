@@ -790,6 +790,22 @@ def test_qualifier_filtering_cross_source_bare_and_http_params(tmp_path):
         assert r9["status"] == "found"
         assert r9["results"][0]["secid"] == "secid:advisory"
 
+        # 10. Cross-source default-language result preserves declared weight (100, not 101)
+        r10 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32",
+        }).json()
+        assert r10["status"] == "found"
+        assert r10["results"][0]["weight"] == 100
+
+        # 11. Combined filter miss blames only the unsatisfied qualifier (parsability), not available lang
+        r11 = client.get("/api/v1/resolve", params={
+            "secid": "secid:regulation/art-32?parsability=structured&lang=de",
+        }).json()
+        assert r11["status"] == "not_found"
+        assert 'No results with parsability "structured"' in r11["message"]
+        assert 'No results for lang "de"' not in r11["message"]
+
+
 
 
 def test_locale_key_orders_hyphen_before_hash():

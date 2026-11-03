@@ -723,7 +723,11 @@ class _Resolution:
             if (p.qualifiers or {}).get("lang"):
                 identifier = p.name + (p.subpath or "")
                 for n in _match_nodes(ns):
-                    msg = _lang_not_found_message(_children(n), identifier, p.qualifiers["lang"])
+                    if _node_data(n).get("version_required"):
+                        continue
+                    msg = _lang_not_found_message(
+                        _children(n), identifier, p.qualifiers["lang"], scoped=False,
+                    )
                     if msg:
                         return _response(self.q, "not_found", [], msg)
             type_results = self.type_scoped_search()
@@ -968,8 +972,6 @@ class _Resolution:
             res = _resolution_result(secid, child.get("weight"), url, cd)
             if lang:
                 res["lang"] = qualifiers.get("lang") or lang.get("default")
-                if not qualifiers.get("lang"):
-                    res["weight"] = _weight(res) + 1
             return res
         return {"secid": secid, "data": {"description": child.get("description"),
                                          "weight": child.get("weight"),
@@ -1044,7 +1046,11 @@ class _Resolution:
             if (p.qualifiers or {}).get("lang"):
                 for ns in self.reg.values():
                     for node in _match_nodes(ns):
-                        msg = _lang_not_found_message(_children(node), identifier, p.qualifiers["lang"])
+                        if _node_data(node).get("version_required"):
+                            continue
+                        msg = _lang_not_found_message(
+                            _children(node), identifier, p.qualifiers["lang"], scoped=False,
+                        )
                         if msg:
                             return _response(self.q, "not_found", [], msg)
             return _response(
@@ -1079,34 +1085,38 @@ def _apply_qualifier_filters(results: list, qualifiers: Optional[dict]) -> Optio
 
 def _qualifier_not_found(query: str, results: list, qualifiers: dict) -> dict:
     parts = []
+    active_keys = [k for k in ("content_type", "parsability", "lang") if qualifiers.get(k)]
+    multi = len(active_keys) > 1
     if qualifiers.get("content_type"):
         available = sorted({r["content_type"] for r in results if "url" in r and r.get("content_type")})
-        if not qualifiers.get("parsability") or qualifiers["content_type"] not in available:
+        if not multi or qualifiers["content_type"] not in available:
             parts.append(f'No results with content_type "{qualifiers["content_type"]}". '
                          f'Available: {", ".join(available) or "none declared"}.')
     if qualifiers.get("parsability"):
         available = sorted({r["parsability"] for r in results if "url" in r and r.get("parsability")})
-        if not qualifiers.get("content_type") or qualifiers["parsability"] not in available:
+        if not multi or qualifiers["parsability"] not in available:
             parts.append(f'No results with parsability "{qualifiers["parsability"]}". '
                          f'Available: {", ".join(available) or "none declared"}.')
     if qualifiers.get("lang"):
         available = sorted({r["lang"] for r in results if "url" in r and r.get("lang")})
-        parts.append(f'No results for lang "{qualifiers["lang"]}". '
-                     f'Available: {", ".join(available) or "none declared"}.')
+        if not multi or qualifiers["lang"] not in available:
+            parts.append(f'No results for lang "{qualifiers["lang"]}". '
+                         f'Available: {", ".join(available) or "none declared"}.')
     if not parts:
         active = ", ".join(
             f'{k}="{qualifiers[k]}"'
-            for k in ("content_type", "parsability", "lang")
-            if qualifiers.get(k)
+            for k in active_keys
         )
         parts.append(f"No results matching combined qualifiers ({active}).")
     parts.append("Remove qualifiers to see all results.")
     return _response(query, "not_found", [], " ".join(parts))
 
 
-def _lang_not_found_message(children: list, subpath: str, lang: str) -> Optional[str]:
+def _lang_not_found_message(
+    children: list, subpath: str, lang: str, scoped: bool = True,
+) -> Optional[str]:
     for child in children:
-        if not matches_any_pattern(child.get("patterns", []), subpath):
+        if not node_matches(child, subpath, scoped):
             continue
         cfg = _node_data(child).get("lang")
         if isinstance(cfg, dict) and lang not in (cfg.get("available") or []):
