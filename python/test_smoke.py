@@ -994,3 +994,60 @@ def test_mcp_rest_api_stays_raw(tmp_path):
     client = TestClient(create_app(ServerConfig(registry_dirs=[str(reg)])))
     body = client.get("/api/v1/resolve", params={"secid": "secid:advisory/example.org/cve"}).json()
     assert body["results"][0]["data"]["description"] == "CVE"
+
+
+def test_empty_match_nodes_returns_namespace_metadata_and_sanitizes_mcp(tmp_path):
+    """Parity with SecID-Service#11 (#32): Level 2 namespace queries for namespaces
+    with empty match_nodes return a single namespace metadata result rather than []."""
+    import json
+    reg = tmp_path / "registry"
+    _write_ns(
+        reg,
+        "entity",
+        "ae/uaepass.json",
+        "uaepass.ae",
+        [],
+        official_name="UAE Pass\u202e",
+        common_name="UAE Pass",
+        alternate_names=["UAEPASS\u202e"],
+        notes="National digital identity\u202e",
+        urls=[{"type": "website", "url": "https://www.uaepass.ae"}],
+        wikidata="Q12345",
+        wikipedia="https://en.wikipedia.org/wiki/UAE_Pass",
+        tags={"country": ["AE"]},
+    )
+    for mode in ("lazy", "bulk"):
+        app = create_app(ServerConfig(registry_dirs=[str(reg)], load_mode=mode, host="0.0.0.0"))
+        with TestClient(app) as client:
+            for q in ("secid:entity/uaepass.ae", "secid:entity/uaepass.ae/*"):
+                body = client.get("/api/v1/resolve", params={"secid": q}).json()
+                assert body["status"] == "found"
+                assert len(body["results"]) == 1
+                assert body["results"][0]["secid"] == "secid:entity/uaepass.ae"
+                data = body["results"][0]["data"]
+                assert data["official_name"] == "UAE Pass\u202e"
+                assert data["common_name"] == "UAE Pass"
+                assert data["alternate_names"] == ["UAEPASS\u202e"]
+                assert data["notes"] == "National digital identity\u202e"
+                assert data["urls"] == [{"type": "website", "url": "https://www.uaepass.ae"}]
+                assert data["wikidata"] == "Q12345"
+                assert data["wikipedia"] == "https://en.wikipedia.org/wiki/UAE_Pass"
+                assert data["source_count"] == 0
+                assert data["country"] == ["AE"]
+
+            if getattr(app.state, "mcp", None) is not None:
+                desc_res = _mcp_call(client, "tools/call", {
+                    "name": "describe", "arguments": {"secid": "secid:entity/uaepass.ae"},
+                })["result"]
+                desc_payload = json.loads(desc_res["content"][0]["text"])
+                mcp_data = desc_payload["results"][0]["data"]
+                assert "official_name" not in mcp_data
+                assert "alternate_names" not in mcp_data
+                assert "notes" not in mcp_data
+                assert mcp_data["source_count"] == 0
+                assert mcp_data["country"] == ["AE"]
+                untrusted = mcp_data["registry_text_untrusted"]
+                assert untrusted["official_name"] == "UAE Pass"
+                assert untrusted["alternate_names"] == ["UAEPASS"]
+                assert untrusted["notes"] == "National digital identity"
+

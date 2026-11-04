@@ -679,7 +679,7 @@ class _Resolution:
         if ns is None:
             return _response(self.q, "not_found", [],
                              f'Namespace "{p.namespace}" not found in type "{p.type}".')
-        if not p.name:
+        if not p.name or p.name == "*":
             return self.list_sources(ns)
         return self.resolve_with_name(ns)
 
@@ -694,8 +694,27 @@ class _Resolution:
 
     # Level 2
     def list_sources(self, ns: dict) -> dict:
+        nodes = _match_nodes(ns)
+        if not nodes:
+            data: dict = {
+                "official_name": ns.get("official_name"),
+                "common_name": ns.get("common_name"),
+                "alternate_names": ns.get("alternate_names"),
+                "notes": ns.get("notes"),
+                "urls": ns.get("urls") or [],
+                "wikidata": ns.get("wikidata"),
+                "wikipedia": ns.get("wikipedia"),
+                "source_count": 0,
+            }
+            country = (ns.get("tags") or {}).get("country") if isinstance(ns.get("tags"), dict) else None
+            if isinstance(country, list) and country:
+                data["country"] = country
+            return _response(self.q, "found", [{
+                "secid": f"secid:{self.p.type}/{self.p.namespace}",
+                "data": data,
+            }])
         results = []
-        for node in _match_nodes(ns):
+        for node in nodes:
             d = _node_data(node)
             results.append({
                 "secid": f"secid:{self.p.type}/{self.p.namespace}/{extract_name_slug(node)}",
@@ -717,9 +736,19 @@ class _Resolution:
             corrected = self.namespace_scoped_search(ns)
             if corrected:
                 filtered = _apply_qualifier_filters(corrected, p.qualifiers)
-                if filtered is None:
-                    return _qualifier_not_found(self.q, corrected, p.qualifiers)
-                return _response(self.q, "corrected", filtered)
+                if filtered is not None:
+                    return _response(self.q, "corrected", filtered)
+                if (p.qualifiers or {}).get("lang"):
+                    identifier = p.name + (p.subpath or "")
+                    for n in _match_nodes(ns):
+                        if _node_data(n).get("version_required"):
+                            continue
+                        msg = _lang_not_found_message(
+                            _children(n), identifier, p.qualifiers["lang"], scoped=False,
+                        )
+                        if msg:
+                            return _response(self.q, "not_found", [], msg)
+                return _qualifier_not_found(self.q, corrected, p.qualifiers)
             if (p.qualifiers or {}).get("lang"):
                 identifier = p.name + (p.subpath or "")
                 for n in _match_nodes(ns):
@@ -856,7 +885,7 @@ class _Resolution:
             return self.describe_source(node)
         results = self.match_children_and_resolve(_children(node), node)
         if results:
-            return self._filtered(results)
+            return self._filtered(results, _children(node))
         if (p.qualifiers or {}).get("lang"):
             msg = _lang_not_found_message(_children(node), p.subpath, p.qualifiers["lang"])
             if msg:
@@ -901,7 +930,7 @@ class _Resolution:
             return _response(self.q, "related", [], "This version has no resolvable items.")
         results = self.match_children_and_resolve(_children(version_child), version_child, name_node=node)
         if results:
-            return self._filtered(results)
+            return self._filtered(results, _children(version_child))
         if (p.qualifiers or {}).get("lang"):
             msg = _lang_not_found_message(_children(version_child), p.subpath, p.qualifiers["lang"])
             if msg:
@@ -909,9 +938,13 @@ class _Resolution:
         return _response(self.q, "related", [],
                          f'Item "{p.subpath}" not found in version {p.version}.')
 
-    def _filtered(self, results: list) -> dict:
+    def _filtered(self, results: list, children: Optional[list] = None) -> dict:
         filtered = _apply_qualifier_filters(results, self.p.qualifiers)
         if filtered is None:
+            if children and (self.p.qualifiers or {}).get("lang"):
+                msg = _lang_not_found_message(children, self.p.subpath, self.p.qualifiers["lang"])
+                if msg:
+                    return _response(self.q, "not_found", [], msg)
             return _qualifier_not_found(self.q, results, self.p.qualifiers)
         return _response(self.q, "found", filtered)
 
@@ -1060,6 +1093,16 @@ class _Resolution:
             )
         filtered = _apply_qualifier_filters(results, p.qualifiers)
         if filtered is None:
+            if (p.qualifiers or {}).get("lang"):
+                for ns in self.reg.values():
+                    for node in _match_nodes(ns):
+                        if _node_data(node).get("version_required"):
+                            continue
+                        msg = _lang_not_found_message(
+                            _children(node), identifier, p.qualifiers["lang"], scoped=False,
+                        )
+                        if msg:
+                            return _response(self.q, "not_found", [], msg)
             return _qualifier_not_found(self.q, results, p.qualifiers)
         filtered.sort(key=lambda r: (-_weight(r), _locale_key(r.get("secid", ""))))
         return _response(self.q, "found", filtered)
@@ -1075,7 +1118,7 @@ def _apply_qualifier_filters(results: list, qualifiers: Optional[dict]) -> Optio
             filtered = [r for r in filtered if "url" in r and r.get(key) == target]
     if qualifiers.get("lang"):
         target = qualifiers["lang"]
-        filtered = [r for r in filtered if "url" not in r or not r.get("lang") or r["lang"] == target]
+        filtered = [r for r in filtered if "url" in r and (not r.get("lang") or r["lang"] == target)]
     if not filtered and results:
         return None
     if not any("url" in r for r in filtered) and any("url" in r for r in results):
