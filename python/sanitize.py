@@ -27,7 +27,7 @@ MAX_ARRAY_ITEMS = 64
 
 # Contributor free-text fields, relocated under `registry_text_untrusted`.
 UNTRUSTED_TEXT_KEYS = frozenset({
-    "description", "notes", "note", "official_name", "common_name", "auth",
+    "description", "notes", "note", "official_name", "common_name", "alternate_names", "auth",
     "contacts", "contact", "scope", "policy", "disclosure_policy",
     "version_disambiguation", "unversioned_behavior", "parsing_instructions",
 })

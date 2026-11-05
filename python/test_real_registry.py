@@ -398,6 +398,10 @@ TARGETED_CASES = [
     Case("type-wildcard", "secid:control/*", "found", first_secid="secid:control"),
     Case("namespace-listing", "secid:advisory/oracle.com", "found",
          first_secid="secid:advisory/oracle.com/cpu"),
+    Case("empty-match-nodes-entity", "secid:entity/uaepass.ae", "found",
+         first_secid="secid:entity/uaepass.ae"),
+    Case("empty-match-nodes-entity-wildcard", "secid:entity/uaepass.ae/*", "found",
+         first_secid="secid:entity/uaepass.ae"),
 ]
 
 
