@@ -158,32 +158,65 @@ def is_node_open(node: dict) -> bool:
 def node_matches(node: dict, value: str, scoped: bool) -> bool:
     """Port of Service nodeMatches():
 
-      1. An open pattern with known_values: the enumeration is a closed set.
-      2. An open pattern with no enumeration cannot discriminate, so it is
+      1. A non-empty list known_values always closes the set (even if the regex
+         is not detected as open by sentinel probing, e.g. `^V-\\d+$`).
+      2. An open pattern with a non-empty dict known_values: the enumeration is
+         a closed set.
+      3. An open pattern with no enumeration cannot discriminate, so it is
          unreachable from an unscoped (cross-namespace) search.
-      3. Otherwise the regex decides.
+      4. Otherwise the regex decides.
 
     `scoped` is True when the caller already named the namespace, which keeps
     genuinely unbounded spaces (GitHub usernames, Jira keys) resolvable.
     """
-    if is_node_open(node):
-        known = (node.get("data") or {}).get("known_values")
+    known = (node.get("data") or {}).get("known_values")
+    if isinstance(known, list):
         if known:
-            return isinstance(known, dict) and value in known
+            return value in known and matches_any_pattern(node.get("patterns", []), value)
+    if is_node_open(node):
+        if isinstance(known, dict) and known:
+            return value in known and matches_any_pattern(node.get("patterns", []), value)
         if not scoped:
             return False
     return matches_any_pattern(node.get("patterns", []), value)
 
 
-def extract_name_slug(node: dict) -> str:
-    """Human-readable source name from the first pattern ("(?i)^cve$" -> "cve")."""
+def _pattern_literal(pat: str) -> Optional[str]:
+    """The literal string an anchored pattern matches, or None when it is not a
+    plain literal (ADR-015: a version node's patterns[0] is the canonical form).
+    `(?i)^1\\.1\\.1$` -> "1.1.1"."""
+    body = re.sub(r"^\(\?i\)", "", pat)
+    body = re.sub(r"^\^", "", body)
+    body = re.sub(r"\$$", "", body)
+    out = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\":
+            if i + 1 >= len(body) or body[i + 1].isalnum():
+                return None  # \d, \w, ...
+            out.append(body[i + 1])
+            i += 2
+        elif ch in ".*+?()[]{}|^$":
+            return None
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out) or None
+
+
+def extract_name_slug(node: dict, matched_name: Optional[str] = None) -> str:
+    """Human-readable source name from the first pattern ("(?i)^cve$" -> "cve").
+    Escaped dots in a literal pattern (e.g. "(?i)^x\\.805$") are preserved,
+    while unescaped regex dots or character classes reject the literal. When
+    patterns[0] is a regex template and the caller matched a specific name,
+    echo matched_name so canonical SecIDs round-trip cleanly."""
     patterns = node.get("patterns") or [""]
-    cleaned = re.sub(r"^\(\?i\)", "", patterns[0] or "", flags=re.IGNORECASE)
-    cleaned = re.sub(r"^\^", "", cleaned)
-    cleaned = re.sub(r"\$$", "", cleaned)
-    cleaned = re.sub(r"\\(.)", r"\1", cleaned)
-    if re.fullmatch(r"[\w-]+", cleaned, flags=re.ASCII):
-        return cleaned.lower()
+    literal = _pattern_literal(patterns[0] or "")
+    if literal and re.fullmatch(r"[\w.-]+", literal, flags=re.ASCII):
+        return literal.lower()
+    if matched_name:
+        return matched_name
     return re.sub(r"\s+", "-", (node.get("description") or "").lower())
 
 
@@ -420,7 +453,14 @@ def _template_variables(child: dict, subpath: str, parent_node: dict,
 
 def _resolve_child_url(child: dict, subpath: str, parent_node: dict,
                        qualifiers: Optional[dict]) -> Optional[str]:
-    template = (child.get("data") or {}).get("url")
+    data = child.get("data") or {}
+    table = data.get("lookup_table")
+    if isinstance(table, dict) and subpath in table:
+        entry = table[subpath]
+        lookup_url = entry if isinstance(entry, str) else (entry.get("url") if isinstance(entry, dict) else None)
+        if isinstance(lookup_url, str) and _absolute_http_template(lookup_url):
+            return lookup_url
+    template = data.get("url")
     if not template or not isinstance(template, str):
         return None
     if "{" not in template:
@@ -571,30 +611,6 @@ def namespace_aliases(ns_key: str, ns: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # Resolution against a (possibly partial) type registry - port of resolver.ts
 # ---------------------------------------------------------------------------
-
-
-def _pattern_literal(pat: str) -> Optional[str]:
-    """The literal string an anchored pattern matches, or None when it is not a
-    plain literal (ADR-015: a version node's patterns[0] is the canonical form).
-    `(?i)^1\\.1\\.1$` -> "1.1.1"."""
-    body = re.sub(r"^\(\?i\)", "", pat)
-    body = re.sub(r"^\^", "", body)
-    body = re.sub(r"\$$", "", body)
-    out = []
-    i = 0
-    while i < len(body):
-        ch = body[i]
-        if ch == "\\":
-            if i + 1 >= len(body) or body[i + 1].isalnum():
-                return None  # \d, \w, ...
-            out.append(body[i + 1])
-            i += 2
-        elif ch in ".*+?()[]{}|^$":
-            return None
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out) or None
 
 
 def _match_version_alias(node: dict, version: str) -> Optional[tuple[str, str]]:
@@ -784,7 +800,7 @@ class _Resolution:
         return self.resolve_subpath(node)
 
     def _version_redirect(self, asked: str, canonical: ParsedSecID, node: dict) -> dict:
-        base = f"secid:{canonical.type}/{canonical.namespace}/{extract_name_slug(node)}@{canonical.version}"
+        base = f"secid:{canonical.type}/{canonical.namespace}/{extract_name_slug(node, canonical.name)}@{canonical.version}"
         target = f"{base}#{canonical.subpath}" if canonical.subpath else base
         return _response(
             self.q, "corrected", [],
@@ -793,7 +809,7 @@ class _Resolution:
 
     def _version_not_found(self, node: dict) -> dict:
         p = self.p
-        slug = extract_name_slug(node)
+        slug = extract_name_slug(node, p.name)
         return _response(
             self.q, "not_found", [],
             f'Version "{p.version}" is not a known version of {slug}. Known versions: {_describe_versions(node)}. '
@@ -804,7 +820,7 @@ class _Resolution:
     def _version_required_miss(self, node: dict) -> dict:
         p = self.p
         d = _node_data(node)
-        slug = extract_name_slug(node)
+        slug = extract_name_slug(node, p.name)
         return _response(
             self.q, "related",
             [{
@@ -852,14 +868,14 @@ class _Resolution:
         if listed:
             if r.get("status") in ("found", "corrected"):
                 r["status"] = "related"
-            note = (f'Version "{version}" not found for {extract_name_slug(node)}. '
+            note = (f'Version "{version}" not found for {extract_name_slug(node, p.name)}. '
                     f'Known versions: {_describe_versions(node)}. Showing the source without a version.')
             r["message"] = f"{note} {r['message']}" if r.get("message") else note
             return r
         return _as_corrected(r)
 
     def _source_secid(self, node: dict, with_version: bool = True) -> str:
-        base = f"secid:{self.p.type}/{self.p.namespace}/{extract_name_slug(node)}"
+        base = f"secid:{self.p.type}/{self.p.namespace}/{extract_name_slug(node, self.p.name)}"
         return f"{base}@{self.p.version}" if (with_version and self.p.version) else base
 
     def describe_source(self, node: dict) -> dict:
@@ -962,7 +978,7 @@ class _Resolution:
             lang = cd.get("lang") if isinstance(cd.get("lang"), dict) else None
             if qualifiers.get("lang") and lang and qualifiers["lang"] not in (lang.get("available") or []):
                 continue
-            base = f"secid:{p.type}/{p.namespace}/{extract_name_slug(slug_node)}"
+            base = f"secid:{p.type}/{p.namespace}/{extract_name_slug(slug_node, p.name)}"
             secid = f"{base}@{p.version}#{subpath}" if p.version else f"{base}#{subpath}"
 
             url = _resolve_child_url(child, subpath, parent_node, p.qualifiers)
@@ -974,16 +990,10 @@ class _Resolution:
                         res["weight"] = _weight(res) + 1
                 results.append(res)
             elif isinstance(cd.get("lookup_table"), dict):
-                # Own-key semantics: the subpath itself is the key.
-                entry = cd["lookup_table"].get(subpath)
-                lookup_url = entry if isinstance(entry, str) else (entry or {}).get("url")
-                if lookup_url and _absolute_http_template(lookup_url):
-                    results.append(_resolution_result(secid, child.get("weight"), lookup_url, cd))
-                else:
-                    results.append({"secid": secid, "data": {
-                        "description": child.get("description"),
-                        "available_items": list(cd["lookup_table"].keys()),
-                    }})
+                results.append({"secid": secid, "data": {
+                    "description": child.get("description"),
+                    "available_items": list(cd["lookup_table"].keys()),
+                }})
             else:
                 data = {"description": child.get("description"), "weight": child.get("weight"),
                         "note": cd.get("note")}
@@ -1050,8 +1060,8 @@ class _Resolution:
                         "source_count": len(_match_nodes(ns)),
                     }})
             for node in _match_nodes(ns):
-                slug = extract_name_slug(node)
                 if node_matches(node, identifier, False):
+                    slug = extract_name_slug(node, identifier)
                     secid = f"secid:{p.type}/{ns_key}/{slug}"
                     nd = _node_data(node)
                     source_url = nd.get("url") or ((ns.get("urls") or [{}])[0] or {}).get("url")
@@ -1068,10 +1078,11 @@ class _Resolution:
                             "common_name": ns.get("common_name"),
                             "child_count": len(_children(node)),
                         }})
+                child_slug = extract_name_slug(node)
                 for child in _children(node):
                     if not node_matches(child, identifier, False):
                         continue
-                    secid = f"secid:{p.type}/{ns_key}/{slug}#{identifier}"
+                    secid = f"secid:{p.type}/{ns_key}/{child_slug}#{identifier}"
                     hit = self._child_hit(secid, child, identifier, node)
                     if hit is not None:
                         results.append(hit)
@@ -1474,10 +1485,10 @@ class RegistryIndex:
         for secid_type in SECID_TYPES:
             for ns_key, ns in self.namespaces(secid_type).items():
                 for node in _match_nodes(ns):
-                    if not is_node_open(node) and matches_any_pattern(node.get("patterns", []), trimmed):
-                        source_matches.append((secid_type, ns_key, extract_name_slug(node)))
+                    if node_matches(node, trimmed, False):
+                        source_matches.append((secid_type, ns_key, extract_name_slug(node, trimmed)))
                     for child in _children(node):
-                        if not is_node_open(child) and matches_any_pattern(child.get("patterns", []), trimmed):
+                        if node_matches(child, trimmed, False):
                             child_matches.setdefault(secid_type, {})[ns_key] = None
                 if needle in self.aliases(ns_key, ns):
                     child_matches.setdefault(secid_type, {})[ns_key] = None

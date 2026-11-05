@@ -1051,3 +1051,143 @@ def test_empty_match_nodes_returns_namespace_metadata_and_sanitizes_mcp(tmp_path
                 assert untrusted["alternate_names"] == ["UAEPASS"]
                 assert untrusted["notes"] == "National digital identity"
 
+
+def test_lookup_table_precedence_known_values_and_canonical_name_slug(tmp_path):
+    """Parity with SecID#177, SecID#181, and SecID#190."""
+    from resolver import extract_name_slug
+
+    # SecID#181: escaped dots in literal patterns[0] are preserved; unescaped wildcard dot falls back
+    assert extract_name_slug({
+        "patterns": ["(?i)^x\\.805$"],
+        "description": "ITU-T X.805 Security architecture",
+    }) == "x.805"
+    assert extract_name_slug({
+        "patterns": ["(?i)^x.805$"],
+        "description": "ITU-T X.805 Wildcard dot",
+    }) == "itu-t-x.805-wildcard-dot"
+
+    reg = tmp_path / "registry"
+    _write_ns(reg, "reference", "dev/spdx.json", "spdx.dev", [{
+        "patterns": ["(?i)^spdx$"],
+        "description": "SPDX",
+        "weight": 100,
+        "data": {},
+        "children": [
+            {
+                "patterns": ["^(Core|Software|AI)$"],
+                "description": "SPDX 3.0.1 profile",
+                "weight": 100,
+                "data": {
+                    "url": "https://spdx.org/rdf/3.0.1/terms/{id}/{id}",
+                    "lookup_table": {
+                        "Core": "https://spdx.org/rdf/3.0.1/terms/Core",
+                    },
+                },
+            },
+            {
+                "patterns": ["^(alpha|beta)$"],
+                "description": "Lookup-only item",
+                "weight": 90,
+                "data": {
+                    "lookup_table": {
+                        "alpha": "https://spdx.dev/lookup/alpha",
+                    },
+                },
+            },
+        ],
+    }])
+    _write_ns(reg, "control", "mil/disa.json", "disa.mil", [
+        {
+            "patterns": ["(?i)^rhel9-stig$"],
+            "description": "RHEL 9 STIG",
+            "weight": 100,
+            "data": {},
+            "children": [
+                {
+                    "patterns": ["^V-\\d+$"],
+                    "description": "STIG V-ID",
+                    "weight": 90,
+                    "data": {
+                        "url": "https://disa.mil/rhel9/{id}",
+                        "known_values": ["V-257777"],
+                    },
+                },
+                {
+                    "patterns": ["^SV-\\d+r\\d+_rule$"],
+                    "description": "STIG SV-ID",
+                    "weight": 90,
+                    "open_pattern": True,
+                    "data": {
+                        "url": "https://disa.mil/rhel9/{id}",
+                        "known_values": ["SV-257777r925318_rule"],
+                    },
+                },
+                {
+                    "patterns": ["^OPEN-\\d+$"],
+                    "description": "Open numeric rule",
+                    "weight": 50,
+                    "open_pattern": True,
+                    "data": {
+                        "url": "https://disa.mil/open/{id}",
+                    },
+                },
+            ],
+        },
+        {
+            "patterns": ["(?i)^gli-\\d+$"],
+            "description": "GLI Technical Standards (GLI-11 through GLI-33)",
+            "weight": 85,
+            "data": {"url": "https://gaminglabs.com/gli-standards/"},
+        },
+    ])
+
+    for mode in ("lazy", "bulk"):
+        client = TestClient(create_app(ServerConfig(registry_dirs=[str(reg)], load_mode=mode)))
+
+        # SecID#177: lookup_table overrides url template; url is fallback; lookup_table-only works in cross-source search
+        r_core = client.get("/api/v1/resolve", params={"secid": "secid:reference/spdx.dev/spdx#Core"}).json()
+        assert r_core["status"] == "found"
+        assert _urls(r_core) == ["https://spdx.org/rdf/3.0.1/terms/Core"]
+
+        r_ai = client.get("/api/v1/resolve", params={"secid": "secid:reference/spdx.dev/spdx#AI"}).json()
+        assert r_ai["status"] == "found"
+        assert _urls(r_ai) == ["https://spdx.org/rdf/3.0.1/terms/AI/AI"]
+
+        r_alpha = client.get("/api/v1/resolve", params={"secid": "secid:reference/alpha"}).json()
+        assert r_alpha["status"] == "found"
+        assert _urls(r_alpha) == ["https://spdx.dev/lookup/alpha"]
+
+        # SecID#190: known_values list closes both scoped and unscoped resolution (with or without open_pattern)
+        r_v_hit = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/rhel9-stig#V-257777"}).json()
+        assert r_v_hit["status"] == "found"
+
+        r_v_miss = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/rhel9-stig#V-999999"}).json()
+        assert r_v_miss["status"] == "related"
+
+        r_v_unscoped_hit = client.get("/api/v1/resolve", params={"secid": "secid:control/V-257777"}).json()
+        assert r_v_unscoped_hit["status"] == "found"
+
+        r_v_unscoped_miss = client.get("/api/v1/resolve", params={"secid": "secid:control/V-999999"}).json()
+        assert r_v_unscoped_miss["status"] == "not_found"
+
+        r_sv_hit = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/rhel9-stig#SV-257777r925318_rule"}).json()
+        assert r_sv_hit["status"] == "found"
+
+        r_sv_miss = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/rhel9-stig#SV-999999r1_rule"}).json()
+        assert r_sv_miss["status"] == "related"
+
+        # open_pattern: True without known_values is excluded from unscoped search, but resolves when scoped
+        r_open_unscoped = client.get("/api/v1/resolve", params={"secid": "secid:control/OPEN-123"}).json()
+        assert r_open_unscoped["status"] == "not_found"
+
+        r_open_scoped = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/rhel9-stig#OPEN-123"}).json()
+        assert r_open_scoped["status"] == "found"
+
+        # SecID#181: regex source pattern echoes matched_name so canonical SecID round-trips
+        r_gli = client.get("/api/v1/resolve", params={"secid": "secid:control/disa.mil/GLI-19"}).json()
+        assert r_gli["status"] == "found"
+        assert r_gli["results"][0]["secid"] == "secid:control/disa.mil/GLI-19"
+        r_gli_rt = client.get("/api/v1/resolve", params={"secid": r_gli["results"][0]["secid"]}).json()
+        assert r_gli_rt["status"] == "found"
+
+
