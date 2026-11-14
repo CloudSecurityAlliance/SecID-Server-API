@@ -19,6 +19,7 @@ its ADR-020; review-5 F1/F13/F14; the cross-vendor review of #38/#68).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -50,6 +51,24 @@ _CASES = _DOC["cases"]
 RLO, ZWSP = chr(0x202E), chr(0x200B)
 
 
+def _expand(v):
+    """Expand the fixture macros ($repeat, $list, $map); same as SecID-Service
+    test/helpers/fixture-macros.ts."""
+    if isinstance(v, list):
+        return [_expand(x) for x in v]
+    if isinstance(v, dict):
+        if list(v) == ["$repeat"]:
+            return "".join(piece * n for piece, n in v["$repeat"])
+        if list(v) == ["$list"]:
+            n, item = v["$list"]
+            return [_expand(item) for _ in range(n)]
+        if list(v) == ["$map"]:
+            prefix, n, value = v["$map"]
+            return {f"{prefix}{i}": _expand(value) for i in range(n)}
+        return {k: _expand(x) for k, x in v.items()}
+    return v
+
+
 def _normalize(v):
     """JSON value with any `text` field that holds JSON compared as parsed JSON."""
     if isinstance(v, list):
@@ -77,15 +96,16 @@ def _normalize(v):
 @pytest.mark.parametrize("case", _CASES, ids=[c["name"] for c in _CASES])
 def test_shared_fixture(case: dict) -> None:
     fn = case["fn"]
+    data = _expand(case["input"])
     if fn == "record":
-        got = sanitize_record_for_mcp(case["input"])
+        got = sanitize_record_for_mcp(data)
     elif fn == "listing":
-        got = sanitize_listing_for_mcp(case["input"])
+        got = sanitize_listing_for_mcp(data)
     elif fn == "jsonrpc":
-        got = sanitize_jsonrpc_for_mcp(case["input"])
+        got = sanitize_jsonrpc_for_mcp(data)
     else:
-        got = sanitize_response_for_mcp(case["input"], service_message=case.get("service_message", False))
-    assert _normalize(json.loads(json.dumps(got))) == _normalize(case["expected"])
+        got = sanitize_response_for_mcp(data, service_message=case.get("service_message", False))
+    assert _normalize(json.loads(json.dumps(got))) == _normalize(_expand(case["expected"]))
 
 
 def test_vocabularies_and_character_policy_match_the_fixtures() -> None:
@@ -102,7 +122,11 @@ def test_vocabularies_and_character_policy_match_the_fixtures() -> None:
         "max_field_chars": sanitize.MAX_FIELD_CHARS, "max_array_items": sanitize.MAX_ARRAY_ITEMS,
         "max_listing_items": sanitize.MAX_LISTING_ITEMS, "max_depth": sanitize.MAX_DEPTH,
         "max_members": sanitize.MAX_MEMBERS, "max_nodes": sanitize.MAX_NODES,
-        "max_output_bytes": sanitize.MAX_OUTPUT_BYTES,
+        "max_output_bytes": sanitize.MAX_OUTPUT_BYTES, "max_scan_chars": sanitize.MAX_SCAN_CHARS,
+        "number_bytes": sanitize.NUMBER_BYTES, "literal_bytes": sanitize.LITERAL_BYTES,
+        "envelope_bytes": sanitize.ENVELOPE_BYTES, "slot_bytes": sanitize.SLOT_BYTES,
+        "pointer_bytes": sanitize.POINTER_BYTES, "max_safe_number": sanitize.MAX_SAFE_NUMBER,
+        "number_marker": sanitize.NUMBER_MARKER,
     } == v["budgets"]
 
 
@@ -313,6 +337,45 @@ def test_budget_bytes_are_cumulative_over_results_in_order() -> None:
     assert out["results"][6] == _MARKER
 
 
+def test_retained_bytes_through_the_real_resolver(tmp_path) -> None:
+    """Review round 3 (P2-1): 256 known_values of 4,000 NULs then 4,000 emoji cannot emit megabytes."""
+    from resolver import resolve
+    from storage import create_store
+
+    nul, emoji = chr(0), chr(0x1F600)
+    path = tmp_path / "advisory" / "example" / "x.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "namespace": "x.example", "type": "advisory", "status": "draft",
+        "status_notes": None, "official_name": "X", "common_name": None, "alternate_names": None, "notes": None,
+        "wikidata": None, "wikipedia": None, "urls": [],
+        "match_nodes": [{"patterns": ["(?i)^src$"], "description": "Source", "weight": 100,
+                         "data": {"known_values": {f"k{i}": nul * 4000 + emoji * 4000 for i in range(256)}}}],
+    }))
+    raw = resolve(create_store("memory"), "secid:advisory/x.example/src", [str(tmp_path)])
+    out = sanitize_response_for_mcp(raw)
+    assert len(json.dumps(out, ensure_ascii=False).encode()) < sanitize.MAX_OUTPUT_BYTES + 64 * sanitize.SLOT_BYTES
+    assert out["results"][0] == _MARKER
+
+
+def test_numeric_rule() -> None:
+    marker = sanitize.NUMBER_MARKER
+    notes = [float("nan"), float("inf"), float("-inf"), 2 ** 53, -(2 ** 53), 1e300, -0.0, 2 ** 53 - 1, 0.5, 10 ** 4000]
+    out = sanitize_response_for_mcp({"status": "found", "results": [{"secid": "secid:advisory/x", "data": {"notes": notes}}]})
+    got = out["results"][0]["data"]["registry_text_untrusted"]["notes"]
+    assert got == [marker] * 6 + [0, 2 ** 53 - 1, 0.5, marker]
+    assert math.copysign(1, got[6]) == 1.0  # not negative zero
+    weight = sanitize_response_for_mcp({"status": "found", "results": [{"secid": "secid:advisory/x", "weight": float("inf")}]})
+    assert weight["results"][0]["registry_text_untrusted"]["weight"] == marker
+
+
+def test_huge_integers_are_charged_and_replaced() -> None:
+    """Review round 3 (P2-2): a 64x64 array of 4,000-digit integers used to produce 16 MB."""
+    big = [[10 ** 3999] * 64 for _ in range(64)]
+    out = sanitize_response_for_mcp({"status": "found", "results": [{"secid": "secid:advisory/x", "data": {"notes": big}}]})
+    assert len(json.dumps(out)) < 200_000
+
+
 def test_listing_is_capped_and_says_so() -> None:
     items = [{"namespace": f"n{i}.example", "source_count": i} for i in range(sanitize.MAX_LISTING_ITEMS + 5)]
     out = sanitize_listing_for_mcp({"type": "advisory", "namespaces": items})
@@ -409,7 +472,8 @@ V = {
     "result_secid": _S(_result_secid),
     "url": _S(lambda x: len(x) <= 2048 and _URL.fullmatch(x) is not None),
     "version": _S(lambda x: len(x) <= 32 and re.fullmatch(
-        r"[vV]?[0-9]{1,8}(?:[._-][0-9]{1,8}){0,5}(?:[._-]?[A-Za-z]{1,3}[0-9]{0,4})?", x) is not None),
+        r"[vV]?[0-9]{1,8}(?:[._-][0-9]{1,8}){0,5}(?:R[0-9]{1,4}|[._-]?(?:RC|rc|rev|alpha|beta|a|b)[0-9]{1,4})?",
+        x) is not None),
     "date": _S(_rx(r"[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?")),
     "mime": _S(_rx(r"(?:application|audio|font|image|message|model|multipart|text|video)/[a-z0-9][a-z0-9.+-]{0,62}")),
     "lang": _S(_rx(r"[a-z]{2,3}")),
@@ -432,7 +496,8 @@ V = {
     "on_match": _S(lambda x: x in {"resolve", "redirect"}),
     "secid_type": _S(lambda x: x in _TYPES),
     "pointer": _S(lambda x: x == MESSAGE_POINTER),
-    "num": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "num": lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool) and not (isinstance(v, float) and (
+        not math.isfinite(v) or math.copysign(1, v) < 0 and v == 0)) and abs(v) <= 9007199254740991),
     "bool": lambda v: isinstance(v, bool),
 }
 
@@ -579,6 +644,12 @@ NEGATIVE_CONTROLS = [
     ("array where a scalar is declared", {"status": "found", "results": [{"url": ["https://x.example/"]}]}),
     ("envelope without _warning", {"status": "found", "results": [{ENVELOPE: {"note": "x"}}]}),
     ("undeclared subtype", {"status": "found", "results": [{"data": {"subtypes": ["ignore-previous-instructions"]}}]}),
+    ("word after digits in a version (1-RUN)", {"status": "found", "results": [
+        {"data": {"versions_available": [{"version": "1-RUN"}]}}]}),
+    ("letters glued to digits (0BEY)", {"status": "found", "results": [
+        {"data": {"versions_available": [{"aliases": [{"label": "0BEY"}]}]}}]}),
+    ("number beyond 2^53 - 1", {"status": "found", "results": [{"weight": 2 ** 53}]}),
+    ("infinite number", {"status": "found", "results": [{"data": {"source_count": float("inf")}}]}),
 ]
 
 

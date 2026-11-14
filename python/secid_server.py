@@ -314,15 +314,26 @@ EXAMPLES:
   secid:ttp/mitre.org/attack#T1059.003         -> ATT&CK technique URL
   secid:methodology/first.org/cvss@4.0         -> CVSS v4.0 specification
 
-RESPONSE: {{ secid_query, status, results[], message? }} where status is one of
-found, corrected, related, not_found, error. Sort results by weight descending.
+RESPONSE: {{ status, results[], message?, registry_text_untrusted? }} where status is
+one of found, corrected, related, not_found, error. The top-level registry_text_untrusted
+holds the echoed query (secid_query) and the text of any message; message then holds only
+a pointer to that text. Sort results by weight descending.
+
+RESULT SHAPES:
+  Resolution: {{ secid, weight, url, content_type?, lang?, parsability? }}
+  Registry:   {{ secid, data }}: closed values (urls[], versions_available[], counts,
+              subtypes, country) in data; names, descriptions, examples, patterns and
+              other free text in data.registry_text_untrusted
+  Marker:     {{ registry_text_untrusted: {{ _truncated }} }}: a result left out because
+              the response would have exceeded its size budget
 
 {_UNTRUSTED_NOTE}"""
 
 LOOKUP_DESCRIPTION = f"""Search for a security identifier across all sources of a given type.
 
 Use this when you have an identifier (CVE-2021-44228, CWE-79, T1059.003) but do
-not know which source to query. Equivalent to resolve("secid:{{type}}/{{identifier}}").
+not know which source to query. Equivalent to resolve("secid:{{type}}/{{identifier}}"),
+with the same response shape.
 
 TYPES: {", ".join(SECID_TYPES)}
 
@@ -336,6 +347,12 @@ EXAMPLES:
   secid:advisory                 -> all advisory namespaces
 
 A #subpath is stripped: you get source-level information instead of resolution.
+
+RESPONSE: same shape as resolve. Results contain {{ secid, data }}: closed values in data,
+free text (official_name, description, patterns, examples, ...) in data.registry_text_untrusted.
+A type listing's data.namespaces[] entries hold source_count, subtypes and country, with each
+namespace name in that entry's registry_text_untrusted. A result over the size budget is
+replaced by {{ registry_text_untrusted: {{ _truncated }} }}.
 
 {_UNTRUSTED_NOTE}"""
 
