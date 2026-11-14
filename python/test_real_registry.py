@@ -257,8 +257,13 @@ TARGETED_CASES = [
          "found", result_secids=["secid:reference/oecd.ai", "secid:reference/oecd.org"]),
     Case("percent-encoded-hash-fallback", "secid:advisory/mitre.org/cve%23CVE-2021-44228",
          "found", url=CVE_URL, first_secid="secid:advisory/mitre.org/cve#CVE-2021-44228"),
+    # The ismap.go.jp control-criteria source took the `ismap` alias (SecID#234), so it now
+    # ranks first; the namespace identity still follows it. Both match production (2026-11-14).
     Case("namespace-identity", "secid:control/ismap",
-         "found", url="https://www.ismap.go.jp/", first_secid="secid:control/ismap.go.jp"),
+         "found", url="https://www.ismap.go.jp/", result_secids=[
+             "secid:control/ismap.go.jp/control-criteria",
+             "secid:control/ismap.go.jp",
+         ]),
 
     # --- versioned (3-level) resolution
     Case("versioned-lookup-table", "secid:weakness/owasp.org/top10@2021#A01",
@@ -384,7 +389,10 @@ TARGETED_CASES = [
         "secid:regulation/europa.eu/dora#art-32",
         "secid:regulation/europa.eu/nis2#art-32",
     ]),
+    # BSI C5 enumerates IAM-12 since SecID#235; version-required sources (ccm) are still skipped.
+    # Matches production (2026-11-14).
     Case("cross-source-skips-version-required", "secid:control/IAM-12", "found", result_secids=[
+        "secid:control/bsi.bund.de/c5#IAM-12",
         "secid:control/cloudsecurityalliance.org/ccm-caiq#IAM-12",
     ]),
     Case("bare-source-name", "cwe", "found", result_secids=[
