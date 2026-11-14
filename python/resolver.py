@@ -879,7 +879,10 @@ class _Resolution:
         return f"{base}@{self.p.version}" if (with_version and self.p.version) else base
 
     def describe_source(self, node: dict) -> dict:
-        data = {k: v for k, v in _node_data(node).items() if v is not None}
+        # Every non-null field except `patterns`: in a response that key holds
+        # only the child regexes the resolver executes (set below), so MCP
+        # output can trust it (SecID-Service#67).
+        data = {k: v for k, v in _node_data(node).items() if v is not None and k != "patterns"}
         if not data.get("official_name"):
             data["official_name"] = node.get("description")
         if not data.get("description"):
