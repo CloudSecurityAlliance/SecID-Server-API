@@ -14,9 +14,12 @@ Check every PR in `SecID-Server-API` against these rules:
 
 ## 2. MCP Output Sanitization and Untrusted Input Handling (`python/sanitize.py`)
 
-- **Recursive MCP output sanitization:** Every MCP tool (`resolve`, `lookup`, `describe` in `python/secid_server.py`) returning registry-derived data must pass its output through `sanitize_response_for_mcp()`. Verify that changes to response shapes or `python/sanitize.py`:
-  - Recursively traverse nested dicts and lists (`sanitize_dict()` / `sanitize_value()`) so `UNTRUSTED_TEXT_KEYS` (`description`, `notes`, `note`, `official_name`, `common_name`, `auth`, `contacts`, `contact`, `scope`, `policy`, `disclosure_policy`, `version_disambiguation`, `unversioned_behavior`, `parsing_instructions`) at any depth are relocated into `registry_text_untrusted` with `registry_text_untrusted._warning`.
-  - Strip C0/C1 control, zero-width, and bidi-override characters (`CONTROL_RE`) and recursively cap strings, lists, and nested dicts via `cap_string()` / `cap_value()` (`MAX_FIELD_CHARS = 4000`, `MAX_ARRAY_ITEMS = 64`), in lockstep with `SecID-Service/src/sanitize.ts`.
+- **MCP output sanitization (`python/sanitize.py`).** Scope: the `resolve`, `lookup` and `describe` payloads (`sanitize_response_for_mcp()`) and every JSON `/mcp` response (`sanitize_jsonrpc_for_mcp()`, `_SanitizeMcpResponses`). Verify that changes to response shapes or `python/sanitize.py`:
+  - Check the budgets before copying (`MAX_DEPTH`, `MAX_MEMBERS`, `MAX_NODES`, `MAX_OUTPUT_BYTES`, `MAX_SCAN_CHARS`), charging output for what will be emitted (retained bytes, numbers, literals, envelopes, slots, the pointer). Apply the numeric rule (finite, at most 2^53 − 1; `-0` → `0`; otherwise `NUMBER_MARKER`) exactly as `SecID-Service/src/sanitize.ts` does.
+  - Keep only **closed values** outside `registry_text_untrusted` (enumerations, dates, ISO codes, MIME types, http(s) URLs with a host, numbers, booleans, numeric version labels, the result's own resolver-built SecID without whitespace). Every free-form registry value and caller echo goes in the envelope; `message` moves behind `MESSAGE_POINTER`. A widened schema, grammar or vocabulary needs a reason the value cannot carry prose and the same change in `SecID-Service/src/sanitize.ts`.
+  - Strip Cc (except TAB/LF/CR), Cf and Default_Ignorable_Code_Point characters (`STRIP_RANGES`, frozen code points, written as `\U` escapes so the source stays ASCII) from every string and key, in lockstep with `SecID-Service/src/sanitize.ts`.
+  - Keep `python/fixtures/mcp-sanitize-fixtures.json` byte-identical to SecID-Service's `test/fixtures/` copy (including `vocabularies`), and `test_mcp_sanitize.py` green on the supported MCP SDK floor (1.23.0) and the current release; its schema tree and validators are deliberately independent.
+  - Exceptions, not sanitized: the JSON-RPC `id`, the tool descriptions, non-JSON responses. Anything new must go through the sanitizer.
 
 ## 3. Endpoint Security, `/admin/reload` Auth, and URL Hardening (`python/secid_server.py`, `python/resolver.py`)
 
