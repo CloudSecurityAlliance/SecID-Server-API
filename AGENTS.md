@@ -21,7 +21,8 @@ SecID-Server-API/
 │   ├── resolver.py          # Core resolution logic (port of SecID-Service)
 │   ├── registry_loader.py   # Loading: bulk, per-namespace, reload after git pull
 │   ├── storage.py           # Storage backends (memory, Redis, memcached, SQLite)
-│   ├── sanitize.py          # MCP output envelope (port of SecID-Service sanitize.ts)
+│   ├── sanitize.py          # MCP output envelope: structural-key allow-list (port of SecID-Service sanitize.ts)
+│   ├── fixtures/            # mcp-sanitize-fixtures.json, byte-identical to SecID-Service's copy
 │   ├── test_smoke.py        # Factory, HTTP endpoints, synthetic registries
 │   ├── test_real_registry.py # Real registry + SecID-Client-SDK fixtures, both load modes
 │   └── requirements.txt
@@ -35,7 +36,7 @@ SecID-Server-API/
 └── AGENTS.md
 ```
 
-- `python/` is the active reference implementation (`secid_server.py` factory + CLI, `resolver.py` port of SecID-Service, `registry_loader.py`, `storage.py`, `sanitize.py` MCP output envelope). Tests: `test_smoke.py`, `test_real_registry.py`.
+- `python/` is the active reference implementation (`secid_server.py` factory + CLI, `resolver.py` port of SecID-Service, `registry_loader.py`, `storage.py`, `sanitize.py` MCP output envelope). Tests: `test_smoke.py`, `test_real_registry.py`, `test_mcp_sanitize.py` (shared sanitizer fixtures and the registry walk).
 - `typescript/` (README placeholder) and `go/` (planned, directory not yet created) are the planned production-throughput implementations.
 - `tests/` points at the shared conformance suite, which lives in `SecID-Client-SDK`.
 - `docker/` documents planned containerization (no Dockerfile or image yet).
@@ -124,7 +125,7 @@ pytest -v -rs
 When running an independent code review (`codex review --base main`, `codex exec`, Claude Code Review via [`REVIEW.md`](REVIEW.md), or human/agent review), check every PR against [`REVIEW.md`](REVIEW.md):
 
 1. **Authority, provenance, and CI guardrails:** Verify `AI-Agent: <Name>` commit trailers and `*Agent: <Name> (SecID governing agent)*` PR headers; require an independent cross-vendor review for any change to `.github/workflows/test.yml`, `AGENTS.md`, or `REVIEW.md`; and never commit runtime secrets or private registry overlays.
-2. **MCP output sanitization (`python/sanitize.py`):** Verify that all MCP tools pass output through `sanitize_response_for_mcp()`, recursively relocating `UNTRUSTED_TEXT_KEYS` into `registry_text_untrusted`, stripping control/bidi characters, and enforcing `MAX_FIELD_CHARS`/`MAX_ARRAY_ITEMS` in lockstep with `SecID-Service/src/sanitize.ts`.
+2. **MCP output sanitization (`python/sanitize.py`):** Verify that all MCP tools pass output through `sanitize_response_for_mcp()`, which is an **allow-list**: only `STRUCTURAL_KEYS` whose values pass their class check stay in place, and every other key moves into `registry_text_untrusted`. It strips control/bidi characters from every string and key and enforces `MAX_FIELD_CHARS`/`MAX_ARRAY_ITEMS`/`MAX_IDENT_CHARS`/`MAX_SPACED_IDENT_CHARS` in lockstep with `SecID-Service/src/sanitize.ts` (ADR-020 there). `python/fixtures/mcp-sanitize-fixtures.json` must stay byte-identical to SecID-Service's `test/fixtures/` copy, and `test_mcp_sanitize.py` (fixtures and registry walk) must pass.
 3. **Endpoint security & `/admin/reload` auth (`python/secid_server.py`, `python/resolver.py`):** Ensure `POST /admin/reload` fails closed (`401`) without a valid `X-Reload-Token` (`hmac.compare_digest`), serializes reloads under lock, and preserves `http`/`https` URL hardening and query input bounds.
 4. **Resolver parity & dual-mode testing:** Keep `TYPE_REGISTRY` and resolution behavior aligned with `SecID-Service`, and verify `pytest` passes across `python/test_smoke.py` and `python/test_real_registry.py` (`lazy` and `bulk` load modes).
 

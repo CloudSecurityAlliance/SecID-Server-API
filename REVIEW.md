@@ -14,9 +14,10 @@ Check every PR in `SecID-Server-API` against these rules:
 
 ## 2. MCP Output Sanitization and Untrusted Input Handling (`python/sanitize.py`)
 
-- **Recursive MCP output sanitization:** Every MCP tool (`resolve`, `lookup`, `describe` in `python/secid_server.py`) returning registry-derived data must pass its output through `sanitize_response_for_mcp()`. Verify that changes to response shapes or `python/sanitize.py`:
-  - Recursively traverse nested dicts and lists (`sanitize_dict()` / `sanitize_value()`) so `UNTRUSTED_TEXT_KEYS` (`description`, `notes`, `note`, `official_name`, `common_name`, `auth`, `contacts`, `contact`, `scope`, `policy`, `disclosure_policy`, `version_disambiguation`, `unversioned_behavior`, `parsing_instructions`) at any depth are relocated into `registry_text_untrusted` with `registry_text_untrusted._warning`.
-  - Strip C0/C1 control, zero-width, and bidi-override characters (`CONTROL_RE`) and recursively cap strings, lists, and nested dicts via `cap_string()` / `cap_value()` (`MAX_FIELD_CHARS = 4000`, `MAX_ARRAY_ITEMS = 64`), in lockstep with `SecID-Service/src/sanitize.ts`.
+- **Allow-list MCP output sanitization:** Every MCP tool (`resolve`, `lookup`, `describe` in `python/secid_server.py`) must pass its output through `sanitize_response_for_mcp()`. Verify that changes to response shapes or `python/sanitize.py`:
+  - Keep the sanitizer an **allow-list**: only `STRUCTURAL_KEYS` stay in place, and only when their string values pass the key's class check (`url`: http(s) without whitespace; `ident`: <= 128 code points, <= 48 if spaced; `nostring`: never a string). Every other key, at any depth, moves into `registry_text_untrusted` with `registry_text_untrusted._warning`. A key added to `STRUCTURAL_KEYS`, or a widened class check, must come with a reason it cannot carry prose, and the same change in `SecID-Service/src/sanitize.ts`.
+  - Strip C0/C1 control, zero-width, and bidi-override characters (`_CONTROL_RE`, written as `\u` escapes so the source stays ASCII) from every string and key, the echoed `secid_query` included, and cap strings (code points) and lists (`MAX_FIELD_CHARS = 4000`, `MAX_ARRAY_ITEMS = 64`), in lockstep with `SecID-Service/src/sanitize.ts`.
+  - Keep `python/fixtures/mcp-sanitize-fixtures.json` byte-identical to SecID-Service's `test/fixtures/` copy, and `test_mcp_sanitize.py` (fixtures plus the registry walk) green.
 
 ## 3. Endpoint Security, `/admin/reload` Auth, and URL Hardening (`python/secid_server.py`, `python/resolver.py`)
 
