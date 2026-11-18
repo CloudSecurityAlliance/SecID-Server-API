@@ -441,15 +441,13 @@ def test_targeted(client: TestClient, case: Case) -> None:
 # ---------------------------------------------------------------------------
 # 4. The registry's own structured examples
 #
-# Child-level data.examples entries of the form {"input", "url"} are the
-# registry's test fixtures (REGISTRY-JSON-FORMAT.md). Every one must resolve
-# to its URL through the namespace-qualified form. Versioned sources are
-# skipped: their examples do not say which version they belong to.
+# Structured examples are executable fixtures for direct items and release trees.
+# A release example may name its version; otherwise use the branch's literal.
 # ---------------------------------------------------------------------------
 
 
 def _registry_examples() -> list[tuple[str, str]]:
-    from resolver import extract_name_slug
+    from resolver import extract_name_slug, _pattern_literal
 
     cases = []
     for path in sorted(REGISTRY_DIR.glob("*/**/*.json")):
@@ -457,14 +455,20 @@ def _registry_examples() -> list[tuple[str, str]]:
             continue
         ns = json.loads(path.read_text())
         for source in ns.get("match_nodes", []):
-            if (source.get("data") or {}).get("version_required"):
-                continue
             slug = extract_name_slug(source)
+            base = f"secid:{ns['type']}/{ns['namespace']}/{slug}"
             for child in source.get("children", []):
-                for ex in (child.get("data") or {}).get("examples") or []:
-                    if isinstance(ex, dict) and ex.get("input") and ex.get("url"):
-                        secid = f"secid:{ns['type']}/{ns['namespace']}/{slug}#{ex['input']}"
-                        cases.append((secid, ex["url"]))
+                is_version = (source.get("data") or {}).get("version_required") or (
+                    (child.get("data") or {}).get("type") == "version" and isinstance(child.get("children"), list))
+                version = _pattern_literal((child.get("patterns") or [""])[0]) if is_version else None
+                for item in (child.get("children") or []) if is_version else [child]:
+                    for ex in (item.get("data") or {}).get("examples") or []:
+                        if isinstance(ex, dict) and ex.get("input") and ex.get("url"):
+                            v = ex.get("version") or version
+                            if is_version and not v:
+                                continue
+                            secid = base + (f"@{v}" if v else "") + f"#{ex['input']}"
+                            cases.append((secid, ex["url"]))
     return cases
 
 

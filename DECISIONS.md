@@ -15,3 +15,10 @@ The existing required-version layout is preserved. Test both lazy and bulk loade
 Rejected: diverging Python behavior, forcing versions on ordinary CWE searches,
 or returning live URLs under a historical version. Service is the behavioral
 reference and merges first; the CWE registry train follows compatible resolvers.
+
+
+Review amendments: keep the pre-existing full source descriptions for required-version
+sources (A1), filter optional release branches out of unversioned item descriptions,
+and exercise structured examples under both required and optional release branches
+(A2). The existing empty-tree path communicates unavailable item coverage without
+substituting a live URL. Source metadata and archived item coverage remain distinct.

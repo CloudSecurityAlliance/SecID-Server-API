@@ -28,6 +28,14 @@ def optional_client(tmp_path, request):
     path.mkdir(parents=True)
     (path / "test.json").write_text(json.dumps({"schema_version": "1.0", "namespace": "test.example",
         "type": "weakness", "status": "draft", "official_name": "Test", "match_nodes": [source]}))
+    required = json.loads(json.dumps(source))
+    required["patterns"] = ["^required$"]
+    required["data"]["version_required"] = True
+    required["data"]["version_disambiguation"] = "Choose an edition"
+    required["children"] = [c for c in required["children"] if isinstance(c.get("children"), list)]
+    document = json.loads((path / "test.json").read_text())
+    document["match_nodes"].append(required)
+    (path / "test.json").write_text(json.dumps(document))
     return TestClient(create_app(ServerConfig(registry_dirs=[str(tmp_path)], load_mode=request.param)))
 
 
@@ -71,3 +79,17 @@ def test_versions_are_not_items(optional_client):
     assert urls(query(optional_client, BASE + "#5.0")) == []
     assert urls(query(optional_client, "secid:weakness/5.0")) == []
     assert urls(query(optional_client, BASE + "#8.0")) == ["https://test.example/schema/8.0"]
+
+
+def test_required_source_description_is_preserved(optional_client):
+    base = "secid:weakness/test.example/required@4.19"
+    data = query(optional_client, base)["results"][0]["data"]
+    assert data["version_required"] is True
+    assert data["version_disambiguation"] == "Choose an edition"
+    assert len(data["versions_available"]) == 4
+    assert urls(query(optional_client, base + "#CWE-79")) == ["https://test.example/4.19.zip"]
+
+
+def test_optional_description_lists_only_items(optional_client):
+    data = query(optional_client, BASE)["results"][0]["data"]
+    assert [p["pattern"] for p in data["patterns"]] == ["(?i)^CWE-(?:79|1448)$", r"^8\.0$"]
