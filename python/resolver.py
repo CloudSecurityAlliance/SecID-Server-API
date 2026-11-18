@@ -613,6 +613,25 @@ def namespace_aliases(ns_key: str, ns: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_version_branch(node: dict) -> bool:
+    return _node_data(node).get("type") == "version" and isinstance(node.get("children"), list)
+
+
+def _version_children(node: dict) -> list:
+    """Port of Service's optional version-tree discriminator; leaves stay items."""
+    return [c for c in _children(node) if _node_data(node).get("version_required")
+            or _is_version_branch(c)]
+
+
+def _described_children(node: dict) -> list:
+    return _children(node) if _node_data(node).get("version_required") else _item_children(node)
+
+
+def _item_children(node: dict) -> list:
+    versions = {id(c) for c in _version_children(node)}
+    return [c for c in _children(node) if id(c) not in versions]
+
+
 def _match_version_alias(node: dict, version: str) -> Optional[tuple[str, str]]:
     """If `version` is an alias of another version of this source, return
     `(canonical, on_match)`. None for a canonical or unknown version."""
@@ -627,8 +646,8 @@ def _match_version_alias(node: dict, version: str) -> Optional[tuple[str, str]]:
             if isinstance(alias, dict) and alias.get("label") == version:
                 on_match = "redirect" if alias.get("on_match") == "redirect" else "resolve"
                 return (canonical, on_match)
-    if d.get("version_required") and _children(node):
-        child = next((c for c in _children(node)
+    if _version_children(node):
+        child = next((c for c in _version_children(node)
                       if matches_any_pattern(c.get("patterns", []), version)), None)
         if child:
             patterns = child.get("patterns") or []
@@ -738,7 +757,7 @@ class _Resolution:
                     "official_name": d.get("official_name") or node.get("description"),
                     "common_name": d.get("common_name"),
                     "description": d.get("description") or node.get("description"),
-                    "child_count": len(_children(node)),
+                    "child_count": len(_described_children(node)),
                 },
             })
         return _response(self.q, "found", results)
@@ -795,6 +814,8 @@ class _Resolution:
             mismatch = self._resolve_version_mismatch(node, ns)
             if mismatch is not None:
                 return mismatch
+        if p.version and not _node_data(node).get("version_required") and _version_children(node):
+            return self.resolve_versioned(node)
         if not p.subpath:
             return self.describe_source(node)
         return self.resolve_subpath(node)
@@ -827,7 +848,7 @@ class _Resolution:
                 "secid": f"secid:{p.type}/{p.namespace}/{slug}",
                 "data": {
                     "official_name": d.get("official_name") or node.get("description"),
-                    "version_required": True,
+                    "version_required": bool(d.get("version_required")),
                     "versions_available": d.get("versions_available") or [],
                     "version_disambiguation": d.get("version_disambiguation"),
                 },
@@ -843,8 +864,8 @@ class _Resolution:
         d = _node_data(node)
         listed = [v["version"] for v in (d.get("versions_available") or [])
                   if isinstance(v, dict) and isinstance(v.get("version"), str)]
-        if d.get("version_required"):
-            children = _children(node)
+        if d.get("version_required") or _version_children(node):
+            children = _version_children(node)
             if not children:
                 return None
             if any(matches_any_pattern(c.get("patterns", []), version) for c in children):
@@ -892,7 +913,7 @@ class _Resolution:
         if _children(node):
             data["patterns"] = [
                 {"pattern": (c.get("patterns") or [None])[0], "description": c.get("description")}
-                for c in _children(node)
+                for c in _described_children(node)
             ]
         return _response(self.q, "found", [{"secid": self._source_secid(node), "data": data}])
 
@@ -902,7 +923,7 @@ class _Resolution:
             return self.resolve_versioned(node)
         if not _children(node):
             return self.describe_source(node)
-        results = self.match_children_and_resolve(_children(node), node)
+        results = self.match_children_and_resolve(_item_children(node), node)
         if results:
             return self._filtered(results, _children(node))
         if (p.qualifiers or {}).get("lang"):
@@ -928,7 +949,7 @@ class _Resolution:
                              "This source requires a version. Specify @version in your query.")
         if not _children(node):
             return self.describe_source(node)
-        version_child = next((c for c in _children(node)
+        version_child = next((c for c in _version_children(node)
                               if matches_any_pattern(c.get("patterns", []), p.version)), None)
         if version_child is None:
             return self._version_not_found(node) if p.subpath else self._version_required_miss(node)
@@ -1030,7 +1051,7 @@ class _Resolution:
         identifier = p.name + (p.subpath or "")
         results = []
         for node in _match_nodes(ns):
-            for child in _children(node):
+            for child in _item_children(node):
                 if not node_matches(child, identifier, True):
                     continue
                 secid = f"secid:{p.type}/{p.namespace}/{extract_name_slug(node)}#{identifier}"
@@ -1079,10 +1100,10 @@ class _Resolution:
                             "weight": weight,
                             "official_name": ns.get("official_name"),
                             "common_name": ns.get("common_name"),
-                            "child_count": len(_children(node)),
+                            "child_count": len(_described_children(node)),
                         }})
                 child_slug = extract_name_slug(node)
-                for child in _children(node):
+                for child in _item_children(node):
                     if not node_matches(child, identifier, False):
                         continue
                     secid = f"secid:{p.type}/{ns_key}/{child_slug}#{identifier}"
@@ -1289,6 +1310,7 @@ class RegistryIndex:
                 for ns_key, ns in data.items()
                 for node in _match_nodes(ns)
                 for child in _children(node)
+                if _node_data(node).get("version_required") or not _is_version_branch(child)
             ]
             self._types[secid_type] = data
             return data
@@ -1491,6 +1513,8 @@ class RegistryIndex:
                     if node_matches(node, trimmed, False):
                         source_matches.append((secid_type, ns_key, extract_name_slug(node, trimmed)))
                     for child in _children(node):
+                        if not _node_data(node).get("version_required") and _is_version_branch(child):
+                            continue
                         if node_matches(child, trimmed, False):
                             child_matches.setdefault(secid_type, {})[ns_key] = None
                 if needle in self.aliases(ns_key, ns):

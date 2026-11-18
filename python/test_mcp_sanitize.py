@@ -686,7 +686,9 @@ def _registry_queries() -> list[str]:
                 base = f"secid:{t}/{ns}/{slug}"
                 queries += [base, f"{base}#__no_such_item__", f"{base}@9.9.9-unknown"]
                 for child in node.get("children") or []:
-                    if (node.get("data") or {}).get("version_required"):
+                    if (node.get("data") or {}).get("version_required") or (
+                        (child.get("data") or {}).get("type") == "version" and isinstance(child.get("children"), list)
+                    ):
                         v = _pattern_literal((child.get("patterns") or [""])[0])
                         if not v:
                             continue
